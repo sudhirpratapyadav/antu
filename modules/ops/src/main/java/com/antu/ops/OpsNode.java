@@ -7,6 +7,7 @@ import com.antu.core.graph.Graph;
 import com.antu.core.graph.Message;
 import com.antu.core.graph.Out;
 import com.antu.core.log.Log;
+import com.antu.core.msg.PosedFrame;
 import com.antu.core.msg.VideoFrame;
 import com.antu.core.node.Node;
 
@@ -63,7 +64,7 @@ public final class OpsNode extends Node {
 
     private Node.Context ctx;
     /** Channel the MJPEG route reads by default. */
-    private volatile String videoChannel = "camera.frame";
+    private volatile String videoChannel = "ar.frame";
     private volatile Twist2 teleop = Twist2.ZERO;
     private volatile long teleopUntilNanos;
     private volatile Runnable onMotorsOn;
@@ -123,20 +124,28 @@ public final class OpsNode extends Node {
         if (ch == null) {
             return HttpServer.Response.notFound("no such channel: " + name);
         }
-        if (!VideoFrame.class.isAssignableFrom(ch.type())) {
+        // Either a bare frame or one carrying its pose. The stream only needs the
+        // pixels; the pose travels over telemetry, where a client can use it.
+        final java.util.function.Function<Object, VideoFrame> extract;
+        if (VideoFrame.class.isAssignableFrom(ch.type())) {
+            extract = v -> (VideoFrame) v;
+        } else if (PosedFrame.class.isAssignableFrom(ch.type())) {
+            extract = v -> ((PosedFrame) v).image;
+        } else {
             return HttpServer.Response.error(400,
-                    name + " carries " + ch.type().getSimpleName() + ", not VideoFrame");
+                    name + " carries " + ch.type().getSimpleName() + ", which is not a frame");
         }
 
         @SuppressWarnings("unchecked")
-        Channel<VideoFrame> video = (Channel<VideoFrame>) ch;
+        Channel<Object> video = (Channel<Object>) ch;
         return HttpServer.Response.stream(
                 "multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY,
-                out -> streamVideo(video, out));
+                out -> streamVideo(video, extract, out));
     }
 
-    private void streamVideo(Channel<VideoFrame> channel, java.io.OutputStream out)
-            throws IOException {
+    private void streamVideo(Channel<Object> channel,
+                             java.util.function.Function<Object, VideoFrame> extract,
+                             java.io.OutputStream out) throws IOException {
         // A one-slot handoff, not a queue: only the newest frame is worth sending,
         // and a viewer on a slow link should see fewer frames rather than older
         // ones. Same reasoning as the camera driver's own backpressure.
@@ -144,8 +153,8 @@ public final class OpsNode extends Node {
                 new java.util.concurrent.atomic.AtomicReference<>();
         final Object wake = new Object();
 
-        Channel.Listener<VideoFrame> listener = m -> {
-            slot.set(m.payload());
+        Channel.Listener<Object> listener = m -> {
+            slot.set(extract.apply(m.payload()));
             synchronized (wake) {
                 wake.notifyAll();
             }

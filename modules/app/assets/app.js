@@ -8,7 +8,8 @@
 // bridge is generic over channels instead of carrying an enum of message types.
 
 const WANTED = ['base.odom', 'base.status', 'base.ranges', 'base.imu',
-                'phone_imu.imu', 'camera.frame'];
+                'phone_imu.imu', 'camera.frame', 'ar.frame', 'ar.pose',
+                'fusion.pose'];
 
 // Full-stick and full-key speeds. A P3-DX will do far more; this is an indoor pace.
 const MAX_SPEED = 0.5;      // m/s
@@ -76,7 +77,7 @@ function render() {
   const odom = latest['base.odom'];
   const ranges = latest['base.ranges'];
   const imu = latest['phone_imu.imu'];
-  const video = latest['camera.frame'];
+  const video = latest['ar.frame'] || latest['camera.frame'];
 
   if (status) {
     el('model').textContent = status.model;
@@ -111,6 +112,19 @@ function render() {
     if (trail.length > 400) trail.shift();
   }
 
+  const fused = latest['fusion.pose'];
+  if (fused) {
+    const near = el('theta');
+    el('theta').textContent = fmt(fused.pose.theta * 180 / Math.PI, 0, '°');
+    const src = el('poseSrc');
+    if (src) {
+      src.textContent = fused.source === 'TRACKED'
+        ? 'tracked'
+        : `dead reckoning ${fused.secondsSinceFix.toFixed(0)}s`;
+      src.className = fused.source === 'TRACKED' ? 'good' : 'warn';
+    }
+  }
+
   if (ranges) {
     const c = ranges.closest;
     const near = el('nearest');
@@ -130,7 +144,8 @@ function render() {
     el('d-vbytes').textContent = `${Math.round(video.sizeBytes / 1024)} KB`;
     // The metadata channel is the honest liveness signal: the img element keeps
     // showing the last frame long after the stream has died.
-    const fresh = Date.now() - (seen['camera.frame'] || 0) < STALE_MS;
+    const fresh = Date.now() -
+      Math.max(seen['ar.frame'] || 0, seen['camera.frame'] || 0) < STALE_MS;
     if (fresh !== videoAlive) {
       videoAlive = fresh;
       el('noVideo').style.display = fresh ? 'none' : 'flex';

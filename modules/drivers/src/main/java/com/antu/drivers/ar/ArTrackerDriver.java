@@ -11,11 +11,15 @@ import android.opengl.GLES20;
 import com.antu.core.geometry.Pose3;
 import com.antu.core.graph.Out;
 import com.antu.core.log.Log;
+import com.antu.core.msg.PosedFrame;
 import com.antu.core.msg.TrackedPose;
+import com.antu.core.msg.VideoFrame;
+import com.antu.drivers.camera.JpegEncoder;
 import com.antu.core.node.Node;
 import com.antu.core.time.Stamp;
 
 import com.google.ar.core.Camera;
+import com.google.ar.core.CameraIntrinsics;
 import com.google.ar.core.Config;
 import com.google.ar.core.Frame;
 import com.google.ar.core.Pose;
@@ -67,17 +71,41 @@ public final class ArTrackerDriver extends Node {
     private static final int GEOM_H = 480;
     /** How long to wait for the tracking thread to wind down. */
     private static final int JOIN_MS = 2500;
+    /**
+     * Frames encoded per second.
+     *
+     * <p>Encoding runs on the tracking thread, so every frame taken is time not
+     * spent tracking. ARCore updates at camera rate; taking a fraction of those
+     * keeps video smooth enough to drive by without starving the thing that
+     * matters more.
+     */
+    private static final double ENCODE_HZ = 10.0;
 
     /** Camera pose in ARCore's world frame, with its tracking state. */
     public final Out<TrackedPose> pose = out("pose", TrackedPose.class);
 
+    /**
+     * The picture, the pose it was taken from, and the intrinsics to interpret
+     * it — as one message.
+     *
+     * <p>This is the pairing that makes reconstruction possible and that two
+     * independent camera consumers could never produce, because only the tracker
+     * knows which pose belongs to which frame.
+     */
+    public final Out<PosedFrame> frame = out("frame", PosedFrame.class);
+
     private final android.content.Context context;
 
     private Thread thread;
+    private volatile long lastEncodeNanos;
     private volatile boolean running;
     private volatile String failure;
     private final AtomicReference<TrackedPose> latest =
             new AtomicReference<>(new TrackedPose(Pose3.IDENTITY, TrackedPose.State.STOPPED, "", 0));
+    /** Newest encoded frame, handed to the tick to publish. */
+    private final AtomicReference<PosedFrame> pendingFrame = new AtomicReference<>();
+    private volatile long encoded;
+    private volatile long droppedFrames;
 
     public ArTrackerDriver(android.content.Context context) {
         super("ar");
@@ -93,6 +121,16 @@ public final class ArTrackerDriver extends Node {
         return running;
     }
 
+    /** Frames encoded since the session started. */
+    public long encodedFrames() {
+        return encoded;
+    }
+
+    /** Frames discarded because the graph did not collect them in time. */
+    public long droppedFrames() {
+        return droppedFrames;
+    }
+
     @Override public void start(Node.Context ctx) {
         running = true;
         failure = null;
@@ -105,6 +143,11 @@ public final class ArTrackerDriver extends Node {
         // declared rate like everything else. The tracker runs at camera speed and
         // the newest estimate is the only one worth having.
         pose.publish(latest.get());
+
+        PosedFrame f = pendingFrame.getAndSet(null);
+        if (f != null) {
+            frame.publish(f);
+        }
     }
 
     @Override public void stop() {
@@ -119,6 +162,54 @@ public final class ArTrackerDriver extends Node {
             }
         }
         latest.set(new TrackedPose(latest.get().pose, TrackedPose.State.STOPPED, "", 0));
+    }
+
+    /**
+     * Encodes a frame if enough time has passed, and pairs it with its pose.
+     *
+     * <p>Runs on the tracking thread, so it is deliberately rate-limited: this is
+     * time ARCore is not spending on vision. The image must be closed, and
+     * failing to do so exhausts the buffer pool and stops the stream dead with no
+     * error anywhere.
+     */
+    private void maybeEncode(Frame source, Camera camera, Pose p) {
+        long now = System.nanoTime();
+        if (now - lastEncodeNanos < (long) (1e9 / ENCODE_HZ)) {
+            return;
+        }
+        android.media.Image image = null;
+        try {
+            image = source.acquireCameraImage();
+            byte[] jpeg = JpegEncoder.encode(image);
+            if (jpeg == null) {
+                return;
+            }
+            lastEncodeNanos = now;
+            encoded++;
+
+            CameraIntrinsics k = camera.getImageIntrinsics();
+            float[] focal = k.getFocalLength();
+            float[] principal = k.getPrincipalPoint();
+
+            if (pendingFrame.get() != null) {
+                // The graph has not collected the previous one; it is stale now.
+                droppedFrames++;
+            }
+            pendingFrame.set(new PosedFrame(
+                    new VideoFrame(jpeg, image.getWidth(), image.getHeight(), encoded),
+                    Pose3.of(p.tx(), p.ty(), p.tz(), p.qx(), p.qy(), p.qz(), p.qw()),
+                    focal[0], focal[1], principal[0], principal[1]));
+        } catch (Throwable t) {
+            // NotYetAvailable is routine early in a session; anything else is
+            // worth a line but not worth stopping tracking over.
+            if (!t.getClass().getSimpleName().contains("NotYetAvailable")) {
+                Log.d(TAG, "frame encode skipped: " + t);
+            }
+        } finally {
+            if (image != null) {
+                image.close();
+            }
+        }
     }
 
     // ---------- the tracking thread ----------
@@ -187,9 +278,9 @@ public final class ArTrackerDriver extends Node {
             Log.i(TAG, "ARCore session running");
 
             while (running) {
-                Frame frame;
+                Frame frameObject;
                 try {
-                    frame = session.update();
+                    frameObject = session.update();
                 } catch (Throwable t) {
                     failure = "update: " + t.getMessage();
                     Log.e(TAG, failure, t);
@@ -197,11 +288,12 @@ public final class ArTrackerDriver extends Node {
                 }
                 frames++;
 
-                Camera camera = frame.getCamera();
+                Camera camera = frameObject.getCamera();
                 TrackingState tracking = camera.getTrackingState();
 
                 if (tracking == TrackingState.TRACKING) {
                     Pose p = camera.getPose();
+                    maybeEncode(frameObject, camera, p);
                     // Full six degrees of freedom. Keeping only translation, as
                     // the original did, discards exactly what is needed to compare
                     // this against the robot's own heading.

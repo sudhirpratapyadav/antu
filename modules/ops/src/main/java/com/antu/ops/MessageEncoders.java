@@ -1,6 +1,7 @@
 package com.antu.ops;
 
 import com.antu.core.msg.RangeScan;
+import com.antu.core.msg.PosedFrame;
 import com.antu.core.msg.VideoFrame;
 
 /**
@@ -35,6 +36,23 @@ public final class MessageEncoders {
             Json.field(sb, "height", f.height, false);
             Json.field(sb, "index", f.index, false);
             Json.field(sb, "sizeBytes", f.sizeBytes(), false);
+            Json.field(sb, "url", "/video.mjpeg", false);
+            sb.append('}');
+        });
+
+        // Metadata and geometry, never the pixels. The pose is the interesting
+        // part over telemetry — it is what says where this picture was taken.
+        Json.register(PosedFrame.class, (sb, f) -> {
+            sb.append('{');
+            Json.field(sb, "width", f.image.width, true);
+            Json.field(sb, "height", f.image.height, false);
+            Json.field(sb, "index", f.image.index, false);
+            Json.field(sb, "sizeBytes", f.image.sizeBytes(), false);
+            Json.field(sb, "cameraPose", f.cameraPose, false);
+            Json.field(sb, "fx", f.fx, false);
+            Json.field(sb, "fy", f.fy, false);
+            Json.field(sb, "cx", f.cx, false);
+            Json.field(sb, "cy", f.cy, false);
             Json.field(sb, "url", "/video.mjpeg", false);
             sb.append('}');
         });

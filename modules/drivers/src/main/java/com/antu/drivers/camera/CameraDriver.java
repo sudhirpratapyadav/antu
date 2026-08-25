@@ -2,8 +2,6 @@ package com.antu.drivers.camera;
 
 import android.content.pm.PackageManager;
 import android.graphics.ImageFormat;
-import android.graphics.Rect;
-import android.graphics.YuvImage;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
@@ -22,10 +20,7 @@ import com.antu.core.msg.VideoFrame;
 import com.antu.core.node.Node;
 import com.antu.core.time.Stamp;
 
-import java.io.ByteArrayOutputStream;
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
@@ -206,7 +201,7 @@ public final class CameraDriver extends Node {
             if (pending.get() != null) {
                 dropped++;
             }
-            byte[] jpeg = encode(image);
+            byte[] jpeg = JpegEncoder.encode(image, QUALITY);
             if (jpeg != null) {
                 captured++;
                 pending.set(new VideoFrame(jpeg, image.getWidth(), image.getHeight(), captured));
@@ -217,70 +212,6 @@ public final class CameraDriver extends Node {
             // Always close, or the reader runs out of buffers and the stream stops
             // dead with no error anywhere.
             image.close();
-        }
-    }
-
-    /** YUV_420_888 to JPEG, via NV21 because that is what YuvImage accepts. */
-    private byte[] encode(Image image) {
-        byte[] nv21 = toNv21(image);
-        if (nv21 == null) {
-            return null;
-        }
-        YuvImage yuv = new YuvImage(nv21, ImageFormat.NV21,
-                image.getWidth(), image.getHeight(), null);
-        ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
-        yuv.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), QUALITY, out);
-        // A fresh array per frame: readers hold this by reference, so a reused
-        // buffer would be rewritten under them mid-send.
-        return out.toByteArray();
-    }
-
-    /**
-     * Packs the planar YUV an Android camera produces into NV21.
-     *
-     * <p>The chroma planes arrive interleaved or planar depending on the device,
-     * and with a row stride that is not always the width. Ignoring either gives a
-     * picture with a green skew, which is the classic symptom.
-     */
-    private static byte[] toNv21(Image image) {
-        Image.Plane[] planes = image.getPlanes();
-        if (planes.length < 3) {
-            return null;
-        }
-        int width = image.getWidth();
-        int height = image.getHeight();
-        byte[] out = new byte[width * height * 3 / 2];
-
-        copyPlane(planes[0], width, height, out, 0, 1);
-
-        // NV21 is V then U, interleaved, at half resolution.
-        int chromaOffset = width * height;
-        int chromaWidth = width / 2;
-        int chromaHeight = height / 2;
-        copyPlane(planes[2], chromaWidth, chromaHeight, out, chromaOffset, 2);
-        copyPlane(planes[1], chromaWidth, chromaHeight, out, chromaOffset + 1, 2);
-        return out;
-    }
-
-    private static void copyPlane(Image.Plane plane, int width, int height,
-                                  byte[] out, int offset, int outStride) {
-        ByteBuffer buffer = plane.getBuffer();
-        int rowStride = plane.getRowStride();
-        int pixelStride = plane.getPixelStride();
-        byte[] row = new byte[rowStride];
-        int pos = offset;
-
-        for (int y = 0; y < height; y++) {
-            int available = Math.min(rowStride, buffer.remaining());
-            buffer.get(row, 0, available);
-            for (int x = 0; x < width; x++) {
-                int from = x * pixelStride;
-                if (from >= available) {
-                    break;
-                }
-                out[pos] = row[from];
-                pos += outStride;
-            }
         }
     }
 
