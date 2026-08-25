@@ -107,9 +107,17 @@ for m in $ANDROID_MODULES; do
 done
 if [ -n "$(echo "$ANDROID_SRC" | tr -d ' ')" ]; then
   echo "== javac drivers ops app"
-  javac --release 8 -nowarn \
+  # Piping javac through grep would hand the pipeline grep's exit status, and the
+  # build would cheerfully package an APK from a failed compile. Capture instead.
+  if ! javac --release 8 -nowarn \
         -classpath "$SDK/android.jar:$OUT/classes${DEPS:+:$DEPS}" \
-        -d $OUT/classes $ANDROID_SRC 2>&1 | grep -v 'bootstrap class path' || true
+        -d $OUT/classes $ANDROID_SRC > $OUT/javac.log 2>&1; then
+    grep -v 'bootstrap class path' $OUT/javac.log || true
+    echo
+    echo "COMPILE FAILED - no APK produced"
+    exit 1
+  fi
+  grep -v 'bootstrap class path' $OUT/javac.log | grep -v '^Note:' || true
 fi
 
 echo "== aapt2 link"
