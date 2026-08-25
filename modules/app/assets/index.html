@@ -2,116 +2,219 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>antu</title>
 <style>
-  :root {
-    --bg: #0d1117; --panel: #151b23; --line: #263041;
-    --text: #e6edf3; --dim: #8b949e; --accent: #4da3ff;
-    --warn: #ff9f43; --bad: #f0616d; --good: #3fb950;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-    -webkit-user-select: none; user-select: none;
-    overscroll-behavior: none;
-  }
-  header {
-    display: flex; align-items: center; gap: 10px;
-    padding: 10px 14px; border-bottom: 1px solid var(--line);
-  }
-  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .5px; }
-  #link { margin-left: auto; color: var(--dim); font-size: 11px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
-  .dot.on { background: var(--good); }
-  main {
-    display: grid; gap: 10px; padding: 10px;
-    grid-template-columns: 1fr;
-  }
-  @media (min-width: 720px) { main { grid-template-columns: 320px 1fr; } }
-  section {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 8px; padding: 10px 12px;
-  }
-  h2 {
-    font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
-    color: var(--dim); margin: 0 0 8px; font-weight: 600;
-  }
-  table { width: 100%; border-collapse: collapse; }
-  td { padding: 2px 0; vertical-align: top; }
-  td:first-child { color: var(--dim); width: 42%; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  canvas { width: 100%; display: block; border-radius: 6px; touch-action: none; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; }
-  button {
-    flex: 1; min-width: 88px; padding: 9px 10px; border-radius: 6px;
-    border: 1px solid var(--line); background: #1c2530; color: var(--text);
-    font: inherit; cursor: pointer;
-  }
-  button:active { background: #243040; }
-  button.danger { background: #6e2530; border-color: #8b2c3a; }
-  button.on { background: #16432c; border-color: #2c6b46; }
-  #channels { font-size: 11px; }
-  #channels td:first-child { width: 46%; color: var(--accent); }
-  .stale { color: var(--warn); }
+/*
+  One screen, never scrolls.
+  ─────────────────────────
+  Driving is a video task: the camera is what you look at, so it is the canvas
+  and everything else is a HUD over it. The sonar sits bottom-left as a minimap,
+  which is a pattern people already read without being taught. Anything that does
+  not matter while the robot is moving — channel list, IMU, raw odometry — lives
+  behind a toggle rather than taking permanent space.
+
+  The layout is flex with min-height:0 on the growing child, which is what
+  actually stops a flex column from overflowing its parent. 100dvh rather than
+  100vh so a mobile address bar does not push the controls off-screen.
+*/
+:root {
+  --bg: #0b0e13;
+  --panel: rgba(16, 21, 29, .82);
+  --line: rgba(120, 140, 170, .22);
+  --text: #e9eff6;
+  --dim: #93a1b4;
+  --accent: #4da3ff;
+  --good: #3fb950;
+  --warn: #ffa657;
+  --bad: #f0616d;
+  --pad: 10px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  display: flex; flex-direction: column;
+  height: 100dvh;
+}
+
+/* ── status strip ─────────────────────────────────────────────────────── */
+#bar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 14px;
+  padding: 8px 12px; border-bottom: 1px solid var(--line);
+  background: #0e1319;
+  padding-top: max(8px, env(safe-area-inset-top));
+}
+#bar .name { font-weight: 600; letter-spacing: .6px; font-size: 13px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); flex: 0 0 auto; }
+.dot.on { background: var(--good); box-shadow: 0 0 8px var(--good); }
+.stat { display: flex; gap: 5px; align-items: baseline; }
+.stat b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat span { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+.spacer { margin-left: auto; }
+.good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+
+/* ── stage: the video, and everything floating over it ────────────────── */
+#stage {
+  flex: 1 1 auto; min-height: 0;      /* the line that prevents scrollbars */
+  position: relative; background: #000; overflow: hidden;
+}
+#video {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: contain;                 /* honest framing: never crop the robot's view */
+  display: block;
+}
+#noVideo {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; color: var(--dim); font-size: 12px; text-align: center;
+  padding: 20px;
+}
+.overlay {
+  position: absolute; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+}
+
+/* sonar minimap, bottom-left */
+#radarBox { left: var(--pad); bottom: var(--pad); padding: 6px; }
+#radar { display: block; width: 148px; height: 148px; }
+@media (max-width: 560px) { #radar { width: 108px; height: 108px; } }
+
+/* stick, bottom-right, where a thumb already is */
+#stickBox { right: var(--pad); bottom: var(--pad); padding: 6px; }
+#stick { display: block; width: 148px; height: 148px; touch-action: none; }
+@media (max-width: 560px) { #stick { width: 118px; height: 118px; } }
+
+/* motion readout, bottom-centre between the two */
+#hud {
+  left: 50%; transform: translateX(-50%); bottom: var(--pad);
+  padding: 7px 12px; display: flex; gap: 16px; align-items: baseline;
+  white-space: nowrap;
+}
+@media (max-width: 720px) { #hud { display: none; } }
+
+/* controls, top-right of the stage */
+#actions { right: var(--pad); top: var(--pad); display: flex; gap: 6px; }
+button {
+  font: inherit; color: var(--text); cursor: pointer;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 11px;
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+}
+button:active { transform: translateY(1px); }
+button.on { background: rgba(63,185,80,.22); border-color: rgba(63,185,80,.5); color: #7ee08b; }
+#estopBtn {
+  background: rgba(240,97,109,.2); border-color: rgba(240,97,109,.55);
+  color: #ff8b95; font-weight: 700; letter-spacing: .5px;
+}
+
+/* keyboard hint, top-left */
+#keys {
+  left: var(--pad); top: var(--pad); padding: 6px 9px;
+  color: var(--dim); font-size: 10.5px; line-height: 1.7;
+}
+kbd {
+  display: inline-block; min-width: 17px; text-align: center;
+  padding: 1px 4px; margin: 0 1px; border-radius: 4px;
+  border: 1px solid var(--line); background: rgba(255,255,255,.06); color: var(--text);
+}
+kbd.hit { background: var(--accent); color: #06121f; border-color: var(--accent); }
+@media (max-width: 720px) { #keys { display: none; } }
+
+/* ── diagnostics drawer ───────────────────────────────────────────────── */
+#drawer {
+  position: absolute; inset: 0; background: rgba(8,11,15,.93);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  padding: 16px; display: none; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px; align-content: start; overflow: auto;
+}
+#drawer.open { display: grid; }
+#drawer h3 {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .9px;
+  color: var(--dim); margin-bottom: 6px; font-weight: 600;
+}
+#drawer table { width: 100%; border-collapse: collapse; }
+#drawer td { padding: 2px 0; }
+#drawer td:first-child { color: var(--dim); }
+#drawer td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.chname { color: var(--accent); }
+.stale { color: var(--warn); }
 </style>
 </head>
 <body>
 
-<header>
+<div id="bar">
   <div class="dot" id="dot"></div>
-  <h1>antu</h1>
-  <span id="link"></span>
-</header>
+  <div class="name">antu</div>
+  <div class="stat"><b id="model">–</b></div>
+  <div class="spacer"></div>
+  <div class="stat"><span>batt</span><b id="battery">–</b></div>
+  <div class="stat"><span>motors</span><b id="motors">–</b></div>
+  <div class="stat"><span>estop</span><b id="estop">–</b></div>
+  <div class="stat"><span>near</span><b id="nearest">–</b></div>
+</div>
 
-<main>
-  <div style="display:flex;flex-direction:column;gap:10px">
-    <section>
-      <h2>base</h2>
-      <table id="state">
-        <tr><td>model</td><td class="num" id="model">–</td></tr>
-        <tr><td>battery</td><td class="num" id="battery">–</td></tr>
-        <tr><td>motors</td><td class="num" id="motors">–</td></tr>
-        <tr><td>e-stop</td><td class="num" id="estop">–</td></tr>
-        <tr><td>x</td><td class="num" id="x">–</td></tr>
-        <tr><td>y</td><td class="num" id="y">–</td></tr>
-        <tr><td>heading</td><td class="num" id="theta">–</td></tr>
-        <tr><td>speed</td><td class="num" id="speed">–</td></tr>
-        <tr><td>turn</td><td class="num" id="turn">–</td></tr>
-        <tr><td>nearest</td><td class="num" id="nearest">–</td></tr>
+<div id="stage">
+  <img id="video" alt="">
+  <div id="noVideo">no video — is the app in the foreground?</div>
+
+  <div class="overlay" id="keys">
+    <kbd id="k-up">↑</kbd><kbd id="k-down">↓</kbd><kbd id="k-left">←</kbd><kbd id="k-right">→</kbd> drive<br>
+    <kbd id="k-space">space</kbd> stop &nbsp; <kbd>shift</kbd> slow<br>
+    <kbd>m</kbd> motors &nbsp; <kbd>i</kbd> info &nbsp; <kbd>e</kbd> e-stop
+  </div>
+
+  <div id="actions">
+    <button id="motorsBtn">motors</button>
+    <button id="infoBtn">info</button>
+    <button id="estopBtn">E-STOP</button>
+  </div>
+
+  <div class="overlay" id="radarBox"><canvas id="radar"></canvas></div>
+  <div class="overlay" id="stickBox"><canvas id="stick"></canvas></div>
+
+  <div class="overlay" id="hud">
+    <div class="stat"><span>speed</span><b id="speed">–</b></div>
+    <div class="stat"><span>turn</span><b id="turn">–</b></div>
+    <div class="stat"><span>hdg</span><b id="theta">–</b></div>
+    <div class="stat"><span>max</span><b id="maxSpeed">–</b></div>
+  </div>
+
+  <div id="drawer">
+    <div>
+      <h3>odometry</h3>
+      <table>
+        <tr><td>x</td><td class="num" id="d-x">–</td></tr>
+        <tr><td>y</td><td class="num" id="d-y">–</td></tr>
+        <tr><td>heading</td><td class="num" id="d-th">–</td></tr>
+        <tr><td>speed</td><td class="num" id="d-v">–</td></tr>
+        <tr><td>turn</td><td class="num" id="d-w">–</td></tr>
       </table>
-    </section>
-
-    <section>
-      <h2>channels</h2>
+    </div>
+    <div>
+      <h3>phone imu</h3>
+      <table>
+        <tr><td>yaw rate</td><td class="num" id="d-gz">–</td></tr>
+        <tr><td>accel z</td><td class="num" id="d-az">–</td></tr>
+        <tr><td>heading</td><td class="num" id="d-ih">–</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>camera</h3>
+      <table>
+        <tr><td>size</td><td class="num" id="d-vsize">–</td></tr>
+        <tr><td>frame</td><td class="num" id="d-vidx">–</td></tr>
+        <tr><td>bytes</td><td class="num" id="d-vbytes">–</td></tr>
+      </table>
+    </div>
+    <div style="grid-column: 1 / -1">
+      <h3>channels</h3>
       <table id="channels"></table>
-    </section>
+    </div>
   </div>
-
-  <div style="display:flex;flex-direction:column;gap:10px">
-    <section>
-      <h2>camera</h2>
-      <img id="video" alt="camera" style="width:100%;display:block;border-radius:6px;background:#000;min-height:120px">
-      <div id="videoInfo" style="color:var(--dim);font-size:11px;margin-top:6px">–</div>
-    </section>
-
-    <section>
-      <h2>sonar &amp; track</h2>
-      <canvas id="radar" height="360"></canvas>
-    </section>
-
-    <section>
-      <h2>drive</h2>
-      <canvas id="stick" height="200"></canvas>
-      <div class="row" style="margin-top:10px">
-        <button id="motorsBtn">motors</button>
-        <button id="resetBtn">reset odom</button>
-        <button id="estopBtn" class="danger">E-STOP</button>
-      </div>
-    </section>
-  </div>
-</main>
+</div>
 
 <script src="app.js"></script>
 </body>
