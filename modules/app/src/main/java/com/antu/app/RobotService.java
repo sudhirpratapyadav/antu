@@ -17,6 +17,7 @@ import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
 import com.antu.brain.CommandArbiter;
 import com.antu.drivers.base.ArcosBaseDriver;
+import com.antu.drivers.ar.ArTrackerDriver;
 import com.antu.drivers.camera.CameraDriver;
 import com.antu.drivers.imu.PhoneImuDriver;
 import com.antu.ops.OpsNode;
@@ -47,6 +48,18 @@ public final class RobotService extends Service {
     /** The camera driver, so its diagnosis is reachable without adb. */
     private static volatile CameraDriver cameraDriver;
 
+    /**
+     * Whether to run ARCore rather than plain video capture.
+     *
+     * <p>They cannot coexist: ARCore takes the camera exclusively. Kept as a flag
+     * so the tracker can be ruled out as the cause of a problem without unpicking
+     * the graph.
+     */
+    private static final boolean USE_ARCORE = true;
+
+    /** The tracker, or null when running plain video instead. */
+    private static volatile ArTrackerDriver arTracker;
+
     /** Port for the operations API. */
     private static final int API_PORT = 8080;
 
@@ -65,9 +78,14 @@ public final class RobotService extends Service {
         return baseDriver;
     }
 
-    /** The camera driver, or null before the graph starts. */
+    /** The camera driver, or null before the graph starts or when ARCore runs. */
     public static CameraDriver camera() {
         return cameraDriver;
+    }
+
+    /** The AR tracker, or null when plain video capture is running instead. */
+    public static ArTrackerDriver tracker() {
+        return arTracker;
     }
 
     @Override public IBinder onBind(Intent intent) {
@@ -101,11 +119,16 @@ public final class RobotService extends Service {
             // the two is a deliberate step, not an accident of naming.
             PhoneImuDriver phoneImu = new PhoneImuDriver(this);
 
-            // 640x480 is a deliberate choice: enough to drive by, and small enough
-            // that JPEG encoding keeps up on a phone that is also running the
-            // control loop.
-            CameraDriver camera = new CameraDriver(this, 640, 480, false);
+            // ARCore takes exclusive camera access, so exactly one of these may
+            // run. The tracker is worth the trade — every frame arrives with the
+            // pose it was taken from, which is the pairing reconstruction needs —
+            // but plain video stays available for a robot with no ARCore, or when
+            // tracking is being ruled out as the cause of something.
+            ArTrackerDriver tracker = USE_ARCORE ? new ArTrackerDriver(this) : null;
+            CameraDriver camera = USE_ARCORE ? null
+                    : new CameraDriver(this, 640, 480, false);
             cameraDriver = camera;
+            arTracker = tracker;
 
             // Everything that wants to drive goes through here. The graph already
             // refuses two writers on one input; the arbiter is where the question
@@ -114,21 +137,28 @@ public final class RobotService extends Service {
             CommandArbiter arbiter = new CommandArbiter()
                     .setLimits(0.6, 1.5);
 
-            Graph g = Graph.builder(Clock.SYSTEM)
+            Graph.Builder builder = Graph.builder(Clock.SYSTEM)
                     // The base runs at the rate ARCOS streams status; ops runs
                     // faster so a held teleop command is refreshed well inside the
                     // driver's silence timeout.
                     .add(base, Rate.hz(10))
                     .add(phoneImu, Rate.hz(50))
-                    .add(camera, Rate.hz(15))
                     .add(ops, Rate.hz(20))
                     // Ops runs faster than the arbiter, which runs faster than the
                     // base, so a held command is refreshed well inside every
                     // timeout downstream of it.
                     .add(arbiter, Rate.hz(15))
                     .connect(ops.cmdVel, arbiter.teleop)
-                    .connect(arbiter.cmdVel, base.cmdVel)
-                    .build();
+                    .connect(arbiter.cmdVel, base.cmdVel);
+
+            if (tracker != null) {
+                // 10 Hz: ARCore runs at camera rate on its own thread, and the
+                // newest estimate is the only one worth republishing.
+                builder.add(tracker, Rate.hz(10));
+            } else {
+                builder.add(camera, Rate.hz(15));
+            }
+            Graph g = builder.build();
 
             baseDriver = base;
             g.spin();
@@ -247,6 +277,7 @@ public final class RobotService extends Service {
         graph = null;
         baseDriver = null;
         cameraDriver = null;
+        arTracker = null;
         if (g != null) {
             g.stop();
         }

@@ -6,6 +6,12 @@
 
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="30" />
 
+    <!-- Android 11 hides other packages unless they are declared, and without
+         this ARCore reports itself as not installed. -->
+    <queries>
+        <package android:name="com.google.ar.core" />
+    </queries>
+
     <!-- The graph outlives the activity: a robot must keep running with the
          screen off, so the work belongs in a foreground service. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -25,6 +31,13 @@
     <application android:label="antu"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <!-- Optional, so the app still installs and drives on a device without
+             ARCore; the tracker node reports itself unavailable instead. -->
+        <meta-data android:name="com.google.ar.core" android:value="optional" />
+        <!-- Contributed by ARCore's own manifest, which this build does not
+             merge. Session creation throws without it. -->
+        <meta-data android:name="com.google.ar.core.min_apk_version" android:value="232620000" />
 
         <activity android:name=".app.MainActivity"
             android:exported="true"
