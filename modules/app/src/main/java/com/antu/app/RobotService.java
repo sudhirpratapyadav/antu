@@ -16,6 +16,7 @@ import com.antu.core.log.Log;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
 import com.antu.brain.CommandArbiter;
+import com.antu.brain.PoseFusion;
 import com.antu.drivers.base.ArcosBaseDriver;
 import com.antu.drivers.ar.ArTrackerDriver;
 import com.antu.drivers.camera.CameraDriver;
@@ -151,10 +152,17 @@ public final class RobotService extends Service {
                     .connect(ops.cmdVel, arbiter.teleop)
                     .connect(arbiter.cmdVel, base.cmdVel);
 
+            // Fusion only makes sense with a tracker to anchor to; without one
+            // the wheels are the whole story and base.odom already says so.
+            PoseFusion fusion = tracker == null ? null : new PoseFusion();
+
             if (tracker != null) {
                 // 10 Hz: ARCore runs at camera rate on its own thread, and the
                 // newest estimate is the only one worth republishing.
-                builder.add(tracker, Rate.hz(10));
+                builder.add(tracker, Rate.hz(10))
+                       .add(fusion, Rate.hz(10))
+                       .connect(tracker.pose, fusion.tracked)
+                       .connect(base.odom, fusion.odom);
             } else {
                 builder.add(camera, Rate.hz(15));
             }
