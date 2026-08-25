@@ -23,8 +23,8 @@ OUT=build
 MIN_API=21
 ABI=arm64-v8a
 
-PURE_MODULES="core brain"
-ANDROID_MODULES="drivers ops app"
+PURE_MODULES="core brain ops"
+ANDROID_MODULES="drivers app"
 
 sources() {   # sources <module> [test]
   local dir="modules/$1/src/${2:-main}/java"

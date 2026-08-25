@@ -16,6 +16,7 @@ import com.antu.core.log.Log;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
 import com.antu.drivers.base.ArcosBaseDriver;
+import com.antu.ops.ApiNode;
 
 import com.arcos.Transport;
 import com.arcos.transport.SimTransport;
@@ -40,6 +41,8 @@ public final class RobotService extends Service {
     private static volatile Graph graph;
     /** The base driver, for the console's motor and e-stop controls. */
     private static volatile ArcosBaseDriver base;
+    /** Port for the operations API. */
+    private static final int API_PORT = 8080;
 
     /** How often the graph reports itself to logcat. */
     private static final long STATS_PERIOD_MS = 5000;
@@ -78,6 +81,16 @@ public final class RobotService extends Service {
             g.add(driver, Rate.hz(10));
             base = driver;
 
+            // The API runs faster than the base so a held teleop command is
+            // refreshed well within the base driver's silence timeout.
+            ApiNode api = new ApiNode(API_PORT, RobotService::graph, this::readAsset)
+                    .withBaseControls(
+                            () -> driver.enableMotors(true),
+                            () -> driver.enableMotors(false),
+                            driver::emergencyStop,
+                            driver::resetOdometry);
+            g.add(api, Rate.hz(20));
+
             g.spin();
             graph = g;
             android.util.Log.i(TAG, "graph running with " + g.nodes().size() + " node(s)");
@@ -85,6 +98,21 @@ public final class RobotService extends Service {
         } catch (Exception e) {
             android.util.Log.e(TAG, "graph failed to start", e);
             stopSelf();
+        }
+    }
+
+    /** Serves the web UI out of the APK's assets. */
+    private byte[] readAsset(String path) {
+        try (java.io.InputStream in = getAssets().open(path)) {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int n;
+            while ((n = in.read(chunk)) > 0) {
+                out.write(chunk, 0, n);
+            }
+            return out.toByteArray();
+        } catch (java.io.IOException e) {
+            return null;                 // absent, which the caller reports as 404
         }
     }
 

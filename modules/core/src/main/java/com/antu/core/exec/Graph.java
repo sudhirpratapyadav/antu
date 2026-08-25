@@ -2,6 +2,7 @@ package com.antu.core.exec;
 
 import com.antu.core.bus.Bus;
 import com.antu.core.bus.Subscription;
+import com.antu.core.log.Log;
 import com.antu.core.node.Node;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
@@ -31,6 +32,8 @@ import java.util.Map;
  * their thread and hand results over through the bus. The tick loop never blocks.
  */
 public final class Graph {
+
+    private static final String TAG = "graph";
 
     private final Bus bus;
     private final Clock clock;
@@ -90,13 +93,28 @@ public final class Graph {
             throw new IllegalStateException("graph has no nodes");
         }
         long now = clock.now().nanos();
+        int ok = 0;
         for (String name : order) {
             Entry e = entries.get(name);
             // Due immediately, so every node gets one tick before any waiting.
             e.nextDueNanos = now;
             e.lastTickNanos = now;
-            e.node.start(e.context);
-            e.started = true;
+            try {
+                e.node.start(e.context);
+                e.started = true;
+                ok++;
+            } catch (Throwable t) {
+                // One node failing to start must not take the robot with it: an
+                // API server whose port is busy is no reason for the drive base to
+                // stay dead. The failure is loud and visible in nodes(), so it
+                // cannot pass for a node that simply had nothing to do.
+                e.errors++;
+                e.started = false;
+                Log.e(TAG, "node " + name + " failed to start; continuing without it", t);
+            }
+        }
+        if (ok == 0) {
+            throw new IllegalStateException("no node started successfully");
         }
         started = true;
     }
@@ -220,6 +238,9 @@ public final class Graph {
     private void tickDue(long nowNanos) {
         for (String name : order) {
             Entry e = entries.get(name);
+            if (!e.started) {
+                continue;                 // failed to start; see start()
+            }
             // Tick if we are nearer the deadline than the next loop would be.
             // Without this slack an early wake-up of a few microseconds defers the
             // node by an entire loop, and a node running at the loop rate ends up

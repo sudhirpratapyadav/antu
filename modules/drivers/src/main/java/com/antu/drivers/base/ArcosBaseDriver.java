@@ -66,6 +66,14 @@ public final class ArcosBaseDriver extends AbstractNode {
     /** The ring is not trusted outside this band, metres. */
     private static final double SONAR_MIN_M = 0.10;
     private static final double SONAR_MAX_M = 4.50;
+    /**
+     * The value a Pioneer transducer reports when nothing echoed back, in mm.
+     *
+     * <p>It is the ring's ceiling, not a measurement: an angled surface reflects
+     * the pulse away and reads exactly the same as an empty room. Passing it
+     * upstream as a 5 m reading would invite a costmap to treat it as free space.
+     */
+    private static final int SONAR_NO_ECHO_MM = 5000;
     /** Wait between connection attempts. */
     private static final long RECONNECT_BACKOFF_NANOS = 3_000_000_000L;
     /** Longer wait after the user refuses USB access, so we do not spam dialogs. */
@@ -362,10 +370,12 @@ public final class ArcosBaseDriver extends AbstractNode {
             for (int i = 0; i < n; i++) {
                 bearings[i] = Angles.toRadians(SONAR_BEARINGS_DEG[i]);
                 int mm = s.sonar[i];
-                // -1 means the transducer has not reported since connecting; a
-                // reading at the ring's ceiling means it heard nothing back.
-                // Neither is a measurement, and neither is free space.
-                ranges[i] = mm < 0 ? RangeScan.NO_RETURN : mm / MM_PER_M;
+                // -1 means the transducer has not reported since connecting, and
+                // the ring's ceiling means it heard nothing back. Neither is a
+                // measurement, so both become NO_RETURN rather than a distance.
+                ranges[i] = (mm < 0 || mm >= SONAR_NO_ECHO_MM)
+                        ? RangeScan.NO_RETURN
+                        : mm / MM_PER_M;
                 any |= mm >= 0;
             }
             if (any) {

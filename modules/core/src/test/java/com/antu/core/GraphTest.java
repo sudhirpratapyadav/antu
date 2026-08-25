@@ -28,6 +28,7 @@ public final class GraphTest {
         replayIsDeterministic(c);
         jitterDoesNotDropTicks(c);
         aSlowNodeGivesUpSlotsRatherThanBursting(c);
+        aNodeThatFailsToStartIsSkipped(c);
 
         c.finish();
     }
@@ -39,6 +40,7 @@ public final class GraphTest {
         final List<String> trace;
         boolean publishes;
         boolean throwsOnTick;
+        boolean throwsOnStart;
         /** Milliseconds of clock time to burn in tick(), to simulate an overrun. */
         long overrunMillis;
         ManualClock burnClock;
@@ -49,6 +51,9 @@ public final class GraphTest {
         }
 
         @Override public void start(Node.Context ctx) {
+            if (throwsOnStart) {
+                throw new IllegalStateException("deliberate start failure");
+            }
             ctx.subscribe(TICKS, m -> received.add(m.payload()));
         }
 
@@ -121,6 +126,32 @@ public final class GraphTest {
         // Declaration order is worth a full cycle of latency, which is why it is
         // insertion order rather than something the scheduler is free to choose.
         c.eq("delivery: consumer saw the publisher", "[0, 1, 2]", consumer.received.toString());
+    }
+
+    /**
+     * A node whose start() throws is skipped, and the rest of the graph runs. An
+     * ops server whose port is taken is no reason for a drive base to stay dead.
+     */
+    private static void aNodeThatFailsToStartIsSkipped(Check c) throws Exception {
+        ManualClock clock = new ManualClock();
+        Graph g = new Graph(clock);
+        List<String> trace = new ArrayList<>();
+        Recorder broken = new Recorder("broken", trace);
+        broken.throwsOnStart = true;
+        Recorder healthy = new Recorder("healthy", trace);
+        g.add(broken, Rate.hz(10));
+        g.add(healthy, Rate.hz(10));
+
+        com.antu.core.log.Log.setSink(com.antu.core.log.Log.NONE);
+        g.start();
+        g.step(5);
+        g.stop();
+        com.antu.core.log.Log.setSink(com.antu.core.log.Log.CONSOLE);
+
+        c.eq("start failure: healthy node ran", 5, healthy.ticksAt.size());
+        c.eq("start failure: broken node never ticked", 0, broken.ticksAt.size());
+        c.eq("start failure: reported as not started", false, g.nodes().get(0).started);
+        c.eq("start failure: counted as an error", 1L, g.nodes().get(0).errors);
     }
 
     /** The mirror image: declared before the producer, the consumer waits a cycle. */
