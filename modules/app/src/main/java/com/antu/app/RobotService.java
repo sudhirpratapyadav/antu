@@ -166,7 +166,8 @@ public final class RobotService extends Service {
                             () -> base.enableMotors(true),
                             () -> base.enableMotors(false),
                             base::emergencyStop,
-                            base::resetOdometry);
+                            base::resetOdometry)
+                    .withShutdown(this::shutdown);
 
             // The phone's IMU is the better sensor and reports far faster than the
             // base's, but it measures the phone. Published separately so fusing
@@ -263,6 +264,50 @@ public final class RobotService extends Service {
             android.util.Log.e(TAG, "graph failed to start", e);
             stopSelf();
         }
+    }
+
+    /**
+     * Stops the graph and the service, from the console's quit button.
+     *
+     * <p>Runs on its own thread rather than the caller's: the ops node is one of
+     * the nodes being stopped, so stopping the graph from inside one of its own
+     * HTTP handlers would have the server waiting on itself.
+     *
+     * <p>{@code stopSelf} rather than {@code System.exit} — Android is entitled to
+     * restart a process that vanishes, and a robot that comes back to life after
+     * being told to quit is worse than one that never stopped.
+     */
+    private void shutdown() {
+        new Thread(() -> {
+            android.util.Log.i(TAG, "shutting down on request");
+            Graph g = graph;
+            graph = null;                // also ends the stats thread's loop
+            if (g != null) {
+                g.stop();
+            }
+            baseDriver = null;
+            arTracker = null;
+            depthMapper = null;
+            cameraDriver = null;
+            stopSelf();
+            MainActivity.quit();
+
+            // The last step, and deliberate. Stopping the service and finishing
+            // the activity leaves no components running, but Android keeps the
+            // process cached — and this one has ARCore, ONNX Runtime and a USB
+            // serial handle loaded natively. Those are held until the process
+            // ends, and a camera the system still believes is claimed is exactly
+            // what makes the next start fail. There is no restart to fear: the
+            // service was stopped explicitly, which cancels START_STICKY, and the
+            // task has been removed.
+            try {
+                Thread.sleep(300);       // let the teardown above finish first
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            android.util.Log.i(TAG, "shutdown complete");
+            System.exit(0);
+        }, "antu-shutdown").start();
     }
 
     /** Serves the web UI out of the APK's assets. */

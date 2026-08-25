@@ -28,6 +28,11 @@ const seen = {};
 let ws = null;
 let motorsOn = false;
 let videoAlive = false;
+// Set once quit has been accepted. Everything that retries checks it: after a
+// deliberate shutdown the socket closing and the video stalling are the correct
+// outcome, and a console that spends the next hour reconnecting to a robot the
+// operator just switched off is reporting a fault that is not one.
+let stopped = false;
 
 // ── connection ─────────────────────────────────────────────────────────────
 
@@ -52,6 +57,7 @@ function connect() {
 
   ws.onclose = () => {
     el('dot').classList.remove('on');
+    if (stopped) return;
     // Reconnect rather than leaving a dead page: the phone restarts and the
     // Wi-Fi drops, and an operator should not have to know to reload.
     setTimeout(connect, 1500);
@@ -464,13 +470,55 @@ function emergencyStop() {
 
 function showDrawer(open) {
   el('drawer').classList.toggle('open', open);
+  if (!open) disarmQuit();
+}
+
+// ── quit ───────────────────────────────────────────────────────────────────
+
+// Two taps, not a confirm() dialog. confirm() blocks the event loop, which stops
+// the drive repeat and the socket pump along with it — the last thing wanted
+// while a robot is moving — and on a phone it is a system modal that can land
+// under the notification shade. Arming in place asks the same question without
+// leaving the page.
+let quitArmTimer = null;
+
+function disarmQuit() {
+  clearTimeout(quitArmTimer);
+  quitArmTimer = null;
+  const b = el('quitBtn');
+  if (b) { b.classList.remove('armed'); b.textContent = 'quit app'; }
+}
+
+function quitApp() {
+  const b = el('quitBtn');
+  if (!quitArmTimer) {
+    b.classList.add('armed');
+    b.textContent = 'tap again to quit';
+    // Long enough to read and act on, short enough that a stray tap does not
+    // leave the console armed indefinitely.
+    quitArmTimer = setTimeout(disarmQuit, 4000);
+    return;
+  }
+  clearTimeout(quitArmTimer);
+  quitArmTimer = null;
+  release();
+  b.classList.remove('armed');
+  b.textContent = 'stopping…';
+  // The reply arrives before the teardown starts; the socket dying afterwards is
+  // the expected end, not a failure, so the banner says so rather than letting
+  // the reconnect logic report a lost robot.
+  fetch('/api/shutdown', { method: 'POST' })
+    .then(() => { stopped = true; el('quitBtn').textContent = 'stopped'; })
+    .catch(() => { b.textContent = 'quit failed'; });
 }
 
 function wireButtons() {
   el('motorsBtn').onclick = toggleMotors;
   el('estopBtn').onclick = emergencyStop;
   el('infoBtn').onclick = () => showDrawer(true);
+  el('mapBtn').onclick = () => { release(); location.href = '/cloud.html'; };
   el('closeBtn').onclick = () => showDrawer(false);
+  el('quitBtn').onclick = quitApp;
 
   // Clicking the backdrop closes, but only the backdrop: a click that started on
   // a panel must not dismiss it, or selecting a value becomes a fight.
@@ -483,7 +531,10 @@ function wireButtons() {
 
 function startVideo() {
   const img = el('video');
-  img.onerror = () => { videoAlive = false; setTimeout(startVideo, 2000); };
+  img.onerror = () => {
+    videoAlive = false;
+    if (!stopped) setTimeout(startVideo, 2000);
+  };
   // Cache-busted so a reconnect starts a new multipart stream rather than
   // resuming a dead one.
   img.src = `/video.mjpeg?t=${Date.now()}`;

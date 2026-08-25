@@ -73,6 +73,14 @@ public final class OpsNode extends Node {
     private volatile Runnable onEmergencyStop;
     private volatile Runnable onResetOdometry;
     /**
+     * Shuts the whole robot down, including this server.
+     *
+     * <p>Separate from the base controls because it is not a robot command: it
+     * ends the process that is serving the request, so the route has to answer
+     * before it runs.
+     */
+    private volatile Runnable onShutdown;
+    /**
      * Driver-specific state the graph cannot know about — whether a camera
      * opened, whether depth is supported, why a transport will not connect.
      *
@@ -110,10 +118,110 @@ public final class OpsNode extends Node {
         return this;
     }
 
+    /**
+     * Wires the action that stops the robot software altogether.
+     *
+     * <p>Without this the only way to stop a phone-hosted robot is to pick the
+     * phone up, and the phone is bolted to the robot with its USB port occupied
+     * by the base — which is exactly when adb is not available either.
+     */
+    public OpsNode withShutdown(Runnable shutdown) {
+        this.onShutdown = shutdown;
+        return this;
+    }
+
     /** Supplies a JSON object of driver state, served at /api/diag. */
     public OpsNode withDiagnostics(Supplier<String> supplier) {
         this.diagnostics = supplier;
         return this;
+    }
+
+    /**
+     * Stops the robot and then the software running it.
+     *
+     * <p>Ordered deliberately. The base is brought to a halt and its motors
+     * disabled first, synchronously, so that a robot which is moving when someone
+     * hits quit is already stopped before anything starts tearing down — the
+     * driver's disconnect would stop it too, but only after every node above it
+     * has gone, and a rolling robot is not a good thing to leave to a shutdown
+     * sequence.
+     *
+     * <p>The teardown itself runs on its own thread after a short pause, because
+     * it stops this very server: run inline, the caller would get a dropped
+     * connection instead of an answer and could not tell "shut down" from
+     * "crashed".
+     */
+    private HttpServer.Response shutdown() {
+        if (onShutdown == null) {
+            return HttpServer.Response.error(501, "no shutdown action wired");
+        }
+        hold(Twist2.ZERO);
+        run(onEmergencyStop);
+        run(onMotorsOff);
+
+        Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(400);       // long enough for the response to flush
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            Log.i(TAG, "shutdown requested over the API");
+            run(onShutdown);
+        }, "antu-shutdown");
+        t.setDaemon(true);
+        t.start();
+        return HttpServer.Response.text("shutting down\n");
+    }
+
+    /**
+     * The cloud as packed binary, for the viewer.
+     *
+     * <p>Count, then positions, then colours — the layout jarvis's scan viewer
+     * already reads. JSON was never an option here: five thousand points is
+     * 60 KB packed and roughly ten times that as text, and the telemetry socket
+     * has a control loop's worth of messages to carry as well.
+     *
+     * <p>Colour is by height, which makes a room legible at a glance: the floor
+     * and the ceiling separate from the walls without anyone having to label
+     * them.
+     */
+    private HttpServer.Response cloudBinary(String name) {
+        Graph g = graphSupplier.get();
+        if (g == null) {
+            return HttpServer.Response.error(503, "graph not running");
+        }
+        Channel<?> ch = g.channel(name);
+        if (ch == null || !PointCloud.class.isAssignableFrom(ch.type())) {
+            return HttpServer.Response.notFound("no point cloud at " + name);
+        }
+        Message<?> latest = ch.latest();
+        PointCloud c = latest == null ? PointCloud.empty() : (PointCloud) latest.payload();
+
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer
+                .allocate(4 + c.size * 12 + c.size * 3)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        buf.putInt(c.size);
+
+        double lowest = Double.MAX_VALUE;
+        double highest = -Double.MAX_VALUE;
+        for (int i = 0; i < c.size; i++) {
+            lowest = Math.min(lowest, c.y(i));
+            highest = Math.max(highest, c.y(i));
+        }
+        double span = Math.max(0.5, highest - lowest);
+
+        for (int i = 0; i < c.size; i++) {
+            buf.putFloat((float) c.x(i));
+            buf.putFloat((float) c.y(i));
+            buf.putFloat((float) c.z(i));
+        }
+        for (int i = 0; i < c.size; i++) {
+            double t = (c.y(i) - lowest) / span;
+            buf.put((byte) (int) (40 + 215 * t));                 // low is dark
+            buf.put((byte) (int) (120 + 100 * Math.sin(Math.PI * t)));
+            buf.put((byte) (int) (255 - 150 * t));                 // high is warm
+        }
+        return HttpServer.Response.bytes("application/octet-stream", buf.array());
     }
 
     /**
@@ -290,7 +398,9 @@ public final class OpsNode extends Node {
             run(onResetOdometry);
             return HttpServer.Response.text("odometry reset\n");
         });
+        server.route("/api/shutdown", r -> shutdown());
         server.route("/video.mjpeg", r -> mjpeg(r.text("channel", videoChannel)));
+        server.route("/cloud.bin", r -> cloudBinary(r.text("channel", "cloud.cloud")));
         server.route("/cloud.ply", r -> ply(r.text("channel", "cloud.cloud")));
         server.route("/api/diag", r -> {
             Supplier<String> d = diagnostics;

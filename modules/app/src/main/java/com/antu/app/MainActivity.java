@@ -34,6 +34,31 @@ public final class MainActivity extends Activity {
     private TextView nodes;
     private TextView topics;
 
+    /**
+     * The visible console, so a shutdown started elsewhere can close it.
+     *
+     * <p>Weak on purpose: this is a static field holding an Activity, which is
+     * the textbook way to leak one. A weak reference lets the activity be
+     * collected normally and simply yields null if it already has.
+     */
+    private static java.lang.ref.WeakReference<MainActivity> instance;
+
+    /**
+     * Closes the console, from {@link RobotService}'s shutdown.
+     *
+     * <p>The service stopping is not enough to end the app: the activity keeps
+     * the process alive, and quitting would leave a frozen console on screen
+     * showing a graph that is no longer running. {@code finishAndRemoveTask}
+     * rather than {@code finish} so the app also leaves the recents list, which
+     * is what someone who pressed quit expects to see.
+     */
+    static void quit() {
+        MainActivity a = instance == null ? null : instance.get();
+        if (a != null) {
+            a.ui.post(a::finishAndRemoveTask);
+        }
+    }
+
     private final Runnable refresh = new Runnable() {
         @Override public void run() {
             render();
@@ -43,6 +68,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        instance = new java.lang.ref.WeakReference<>(this);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -76,6 +102,13 @@ public final class MainActivity extends Activity {
         } else {
             startService(service);
         }
+    }
+
+    @Override protected void onDestroy() {
+        if (instance != null && instance.get() == this) {
+            instance = null;
+        }
+        super.onDestroy();
     }
 
     @Override protected void onResume() {
