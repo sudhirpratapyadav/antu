@@ -15,6 +15,7 @@ import com.antu.core.graph.Graph;
 import com.antu.core.log.Log;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
+import com.antu.brain.CommandArbiter;
 import com.antu.drivers.base.ArcosBaseDriver;
 import com.antu.drivers.camera.CameraDriver;
 import com.antu.drivers.imu.PhoneImuDriver;
@@ -106,6 +107,13 @@ public final class RobotService extends Service {
             CameraDriver camera = new CameraDriver(this, 640, 480, false);
             cameraDriver = camera;
 
+            // Everything that wants to drive goes through here. The graph already
+            // refuses two writers on one input; the arbiter is where the question
+            // of who wins gets an answer, and it is the socket a planner or an
+            // agent plugs into later without touching the ops layer.
+            CommandArbiter arbiter = new CommandArbiter()
+                    .setLimits(0.6, 1.5);
+
             Graph g = Graph.builder(Clock.SYSTEM)
                     // The base runs at the rate ARCOS streams status; ops runs
                     // faster so a held teleop command is refreshed well inside the
@@ -114,7 +122,12 @@ public final class RobotService extends Service {
                     .add(phoneImu, Rate.hz(50))
                     .add(camera, Rate.hz(15))
                     .add(ops, Rate.hz(20))
-                    .connect(ops.cmdVel, base.cmdVel)
+                    // Ops runs faster than the arbiter, which runs faster than the
+                    // base, so a held command is refreshed well inside every
+                    // timeout downstream of it.
+                    .add(arbiter, Rate.hz(15))
+                    .connect(ops.cmdVel, arbiter.teleop)
+                    .connect(arbiter.cmdVel, base.cmdVel)
                     .build();
 
             baseDriver = base;
