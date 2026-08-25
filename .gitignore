@@ -6,3 +6,6 @@ debug.keystore
 local.properties
 .idea/
 *.iml
+
+# ONNX Runtime is 27 MB; vendored by tools/vendor-onnx.sh rather than committed
+libs/onnxruntime.aar
