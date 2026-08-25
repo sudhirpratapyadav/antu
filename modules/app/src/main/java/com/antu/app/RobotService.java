@@ -16,6 +16,7 @@ import com.antu.core.log.Log;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
 import com.antu.drivers.base.ArcosBaseDriver;
+import com.antu.drivers.camera.CameraDriver;
 import com.antu.drivers.imu.PhoneImuDriver;
 import com.antu.ops.OpsNode;
 
@@ -42,6 +43,9 @@ public final class RobotService extends Service {
     private static volatile Graph graph;
     /** The base driver, for the console's motor and e-stop controls. */
     private static volatile ArcosBaseDriver baseDriver;
+    /** The camera driver, so its diagnosis is reachable without adb. */
+    private static volatile CameraDriver cameraDriver;
+
     /** Port for the operations API. */
     private static final int API_PORT = 8080;
 
@@ -58,6 +62,11 @@ public final class RobotService extends Service {
     /** The base driver, or null before the graph starts. */
     public static ArcosBaseDriver base() {
         return baseDriver;
+    }
+
+    /** The camera driver, or null before the graph starts. */
+    public static CameraDriver camera() {
+        return cameraDriver;
     }
 
     @Override public IBinder onBind(Intent intent) {
@@ -91,12 +100,19 @@ public final class RobotService extends Service {
             // the two is a deliberate step, not an accident of naming.
             PhoneImuDriver phoneImu = new PhoneImuDriver(this);
 
+            // 640x480 is a deliberate choice: enough to drive by, and small enough
+            // that JPEG encoding keeps up on a phone that is also running the
+            // control loop.
+            CameraDriver camera = new CameraDriver(this, 640, 480, false);
+            cameraDriver = camera;
+
             Graph g = Graph.builder(Clock.SYSTEM)
                     // The base runs at the rate ARCOS streams status; ops runs
                     // faster so a held teleop command is refreshed well inside the
                     // driver's silence timeout.
                     .add(base, Rate.hz(10))
                     .add(phoneImu, Rate.hz(50))
+                    .add(camera, Rate.hz(15))
                     .add(ops, Rate.hz(20))
                     .connect(ops.cmdVel, base.cmdVel)
                     .build();
@@ -217,6 +233,7 @@ public final class RobotService extends Service {
         Graph g = graph;
         graph = null;
         baseDriver = null;
+        cameraDriver = null;
         if (g != null) {
             g.stop();
         }

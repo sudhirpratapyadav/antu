@@ -8,7 +8,8 @@
 // which is the whole reason the bridge is generic over channels rather than
 // carrying an enum of message types.
 
-const WANTED = ['base.odom', 'base.status', 'base.ranges', 'base.imu', 'phone_imu.imu'];
+const WANTED = ['base.odom', 'base.status', 'base.ranges', 'base.imu',
+                'phone_imu.imu', 'camera.frame'];
 
 // Full-stick speeds. A P3-DX will do far more; this is a sane indoor pace.
 const MAX_SPEED = 0.5;          // m/s
@@ -106,6 +107,12 @@ function render() {
     el('turn').textContent = fmt(odom.velocity.angular * 180 / Math.PI, 1, '°/s');
     trail.push({ x: odom.pose.x, y: odom.pose.y, th: odom.pose.theta });
     if (trail.length > 400) trail.shift();
+  }
+
+  const video = latest['camera.frame'];
+  if (video) {
+    el('videoInfo').textContent =
+      `${video.width}x${video.height}  ${Math.round(video.sizeBytes / 1024)} KB  #${video.index}`;
   }
 
   if (ranges) {
@@ -326,8 +333,18 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pagehide', release);
 
+// The MJPEG stream is a plain img src, so the browser handles decoding and
+// reconnection. Only the metadata comes over the telemetry socket; sending
+// frames as base64 there would swamp it.
+function startVideo() {
+  const img = el('video');
+  img.onerror = () => setTimeout(startVideo, 2000);
+  img.src = `/video.mjpeg?t=${Date.now()}`;
+}
+
 wireStick();
 wireButtons();
+startVideo();
 drawStick();
 drawRadar();
 connect();

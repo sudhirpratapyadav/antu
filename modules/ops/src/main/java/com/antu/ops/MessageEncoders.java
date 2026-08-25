@@ -1,6 +1,7 @@
 package com.antu.ops;
 
 import com.antu.core.msg.RangeScan;
+import com.antu.core.msg.VideoFrame;
 
 /**
  * JSON encoders for message types that {@link Json}'s field reflection cannot
@@ -25,6 +26,18 @@ public final class MessageEncoders {
             return;
         }
         installed = true;
+
+        // Metadata only. Base64 of a megabyte per frame would flood the telemetry
+        // socket and is useless to read; the pixels go over /video.mjpeg instead.
+        Json.register(VideoFrame.class, (sb, f) -> {
+            sb.append('{');
+            Json.field(sb, "width", f.width, true);
+            Json.field(sb, "height", f.height, false);
+            Json.field(sb, "index", f.index, false);
+            Json.field(sb, "sizeBytes", f.sizeBytes(), false);
+            Json.field(sb, "url", "/video.mjpeg", false);
+            sb.append('}');
+        });
 
         Json.register(RangeScan.class, (sb, scan) -> {
             sb.append('{');

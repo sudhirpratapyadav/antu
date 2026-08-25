@@ -62,6 +62,14 @@ public final class MainActivity extends Activity {
         scroll.addView(root);
         setContentView(scroll);
 
+        // A service cannot raise a permission dialog, so the activity asks and the
+        // camera driver reports itself unavailable until it is granted.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && checkSelfPermission(android.Manifest.permission.CAMERA)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] {android.Manifest.permission.CAMERA}, 1);
+        }
+
         Intent service = new Intent(this, RobotService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(service);

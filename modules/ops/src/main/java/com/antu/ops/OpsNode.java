@@ -7,6 +7,7 @@ import com.antu.core.graph.Graph;
 import com.antu.core.graph.Message;
 import com.antu.core.graph.Out;
 import com.antu.core.log.Log;
+import com.antu.core.msg.VideoFrame;
 import com.antu.core.node.Node;
 
 import java.io.IOException;
@@ -48,6 +49,8 @@ public final class OpsNode extends Node {
     private static final double DEFAULT_MAX_HZ = 20.0;
     /** How long a teleop command is held before it is treated as abandoned. */
     private static final double TELEOP_HOLD_SECONDS = 0.3;
+    /** Multipart separator for the MJPEG stream. */
+    private static final String MJPEG_BOUNDARY = "antuframe";
 
     /** The velocity command produced by whoever is driving through the API. */
     public final Out<Twist2> cmdVel = out("cmd_vel", Twist2.class);
@@ -59,6 +62,8 @@ public final class OpsNode extends Node {
     private final List<Client> clients = new ArrayList<>();
 
     private Node.Context ctx;
+    /** Channel the MJPEG route reads by default. */
+    private volatile String videoChannel = "camera.frame";
     private volatile Twist2 teleop = Twist2.ZERO;
     private volatile long teleopUntilNanos;
     private volatile Runnable onMotorsOn;
@@ -92,6 +97,90 @@ public final class OpsNode extends Node {
         this.onEmergencyStop = emergencyStop;
         this.onResetOdometry = resetOdometry;
         return this;
+    }
+
+    /** Names the channel served at /video.mjpeg. */
+    public OpsNode withVideoChannel(String channelName) {
+        this.videoChannel = channelName;
+        return this;
+    }
+
+    /**
+     * Serves a channel of {@link com.antu.core.msg.VideoFrame} as MJPEG.
+     *
+     * <p>Multipart rather than WebRTC or a WebSocket with Media Source
+     * Extensions. Those are better on bandwidth and latency, and both cost a large
+     * dependency; multipart works in an img tag in every browser, needs nothing,
+     * and can be opened directly to see whether the camera is alive. On a robot's
+     * own network that trade is worth taking.
+     */
+    private HttpServer.Response mjpeg(String name) {
+        Graph g = graphSupplier.get();
+        if (g == null) {
+            return HttpServer.Response.error(503, "graph not running");
+        }
+        Channel<?> ch = g.channel(name);
+        if (ch == null) {
+            return HttpServer.Response.notFound("no such channel: " + name);
+        }
+        if (!VideoFrame.class.isAssignableFrom(ch.type())) {
+            return HttpServer.Response.error(400,
+                    name + " carries " + ch.type().getSimpleName() + ", not VideoFrame");
+        }
+
+        @SuppressWarnings("unchecked")
+        Channel<VideoFrame> video = (Channel<VideoFrame>) ch;
+        return HttpServer.Response.stream(
+                "multipart/x-mixed-replace; boundary=" + MJPEG_BOUNDARY,
+                out -> streamVideo(video, out));
+    }
+
+    private void streamVideo(Channel<VideoFrame> channel, java.io.OutputStream out)
+            throws IOException {
+        // A one-slot handoff, not a queue: only the newest frame is worth sending,
+        // and a viewer on a slow link should see fewer frames rather than older
+        // ones. Same reasoning as the camera driver's own backpressure.
+        final java.util.concurrent.atomic.AtomicReference<VideoFrame> slot =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        final Object wake = new Object();
+
+        Channel.Listener<VideoFrame> listener = m -> {
+            slot.set(m.payload());
+            synchronized (wake) {
+                wake.notifyAll();
+            }
+        };
+        channel.addListener(listener);
+        try {
+            long lastIndex = -1;
+            while (true) {
+                VideoFrame frame = slot.get();
+                if (frame == null || frame.index == lastIndex) {
+                    synchronized (wake) {
+                        try {
+                            // Wake on a new frame, but time out so a stalled camera
+                            // does not leave this thread parked forever.
+                            wake.wait(1000);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                lastIndex = frame.index;
+
+                byte[] jpeg = frame.jpeg();
+                out.write(("--" + MJPEG_BOUNDARY + "\r\n"
+                        + "Content-Type: image/jpeg\r\n"
+                        + "Content-Length: " + jpeg.length + "\r\n\r\n").getBytes("UTF-8"));
+                out.write(jpeg);
+                out.write("\r\n".getBytes("UTF-8"));
+                out.flush();
+            }
+        } finally {
+            channel.removeListener(listener);
+        }
     }
 
     /** Where the API is reachable, for the console to display. */
@@ -131,6 +220,7 @@ public final class OpsNode extends Node {
             run(onResetOdometry);
             return HttpServer.Response.text("odometry reset\n");
         });
+        server.route("/video.mjpeg", r -> mjpeg(r.text("channel", videoChannel)));
         server.upgrade("/ws", this::onUpgrade);
         server.fallback(this::asset);
         server.start();

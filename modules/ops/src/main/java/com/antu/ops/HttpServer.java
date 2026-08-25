@@ -92,16 +92,45 @@ public final class HttpServer {
         }
     }
 
+    /** Writes an open-ended response body, such as an MJPEG stream. */
+    public interface Body {
+        /**
+         * Writes until the client goes away or the caller stops it.
+         *
+         * @throws IOException when the client disconnects, which is the normal way
+         *         a stream ends and not worth logging as a failure
+         */
+        void writeTo(OutputStream out) throws IOException;
+    }
+
     /** What a handler returns. */
     public static final class Response {
         final int status;
         final String contentType;
         final byte[] body;
+        /** Set instead of {@link #body} for a response of unknown length. */
+        final Body stream;
 
-        private Response(int status, String contentType, byte[] body) {
+        private Response(int status, String contentType, byte[] body, Body stream) {
             this.status = status;
             this.contentType = contentType;
             this.body = body;
+            this.stream = stream;
+        }
+
+        private Response(int status, String contentType, byte[] body) {
+            this(status, contentType, body, null);
+        }
+
+        /**
+         * A response with no known length, written incrementally.
+         *
+         * <p>Served on a thread of its own: an MJPEG stream lasts as long as
+         * someone is watching, and holding a pool worker for that would retire it
+         * permanently. Four viewers would deadlock the rest of the API.
+         */
+        public static Response stream(String contentType, Body body) {
+            return new Response(200, contentType, null, body);
         }
 
         public static Response json(String body) {
@@ -285,7 +314,18 @@ public final class HttpServer {
                 respond(socket, Response.notFound("no such endpoint: " + request.path));
                 return;
             }
-            respond(socket, handler.handle(request));
+            Response response = handler.handle(request);
+            if (response.stream != null) {
+                // Hand the socket to its own thread, as with an upgrade: this
+                // response outlives the request.
+                upgraded = true;
+                Thread t = new Thread(() -> streamResponse(socket, response),
+                        "antu-http-stream");
+                t.setDaemon(true);
+                t.start();
+                return;
+            }
+            respond(socket, response);
         } catch (Exception e) {
             try {
                 respond(socket, Response.error(500, "handler failed: " + e));
@@ -349,6 +389,30 @@ public final class HttpServer {
             return null;
         }
         return new String(buf.toByteArray(), "UTF-8");
+    }
+
+    private static void streamResponse(Socket socket, Response response) {
+        try {
+            // No read timeout: a viewer that only watches sends nothing, and
+            // treating that as a dead client would drop every stream.
+            socket.setSoTimeout(0);
+            OutputStream out = socket.getOutputStream();
+            out.write(("HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: " + response.contentType + "\r\n"
+                    + "Access-Control-Allow-Origin: *\r\n"
+                    + "Cache-Control: no-store\r\n"
+                    + "Connection: close\r\n\r\n").getBytes("UTF-8"));
+            out.flush();
+            response.stream.writeTo(out);
+        } catch (IOException e) {
+            // The viewer closed the tab. Normal, not a failure.
+        } finally {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // Already gone.
+            }
+        }
     }
 
     private static void respond(Socket socket, Response response) throws IOException {
