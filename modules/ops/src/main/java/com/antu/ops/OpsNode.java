@@ -1,0 +1,572 @@
+package com.antu.ops;
+
+import com.antu.core.geometry.Angles;
+import com.antu.core.geometry.Twist2;
+import com.antu.core.graph.Channel;
+import com.antu.core.graph.Graph;
+import com.antu.core.graph.Message;
+import com.antu.core.graph.Out;
+import com.antu.core.log.Log;
+import com.antu.core.node.Node;
+
+import java.io.IOException;
+import java.net.Socket;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
+
+/**
+ * The operations layer: introspection, telemetry and control over HTTP and
+ * WebSocket.
+ *
+ * <p>One node rather than two. An API server and a bridge that both wanted to
+ * command the robot were two writers on one input, which the graph builder now
+ * refuses — correctly, since a robot taking velocity from two places stutters
+ * between them. Merging them makes the single {@link #cmdVel} output honest, and
+ * they were already sharing a server anyway.
+ *
+ * <h2>Generic over channels</h2>
+ *
+ * <p>There is no list of message types here and no per-channel branch. Clients
+ * name channels and get whatever those channels carry, encoded by {@link Json}.
+ * Wiring a new node into the graph makes its channels visible here with nothing
+ * to add — no event enum, no dispatch case, no mirrored type in the client.
+ *
+ * <p>The static graph removed the awkward part. Every channel exists before
+ * anything runs, so there is no "channel does not exist yet", no subscribing
+ * before a publisher appears, and no catalogue that changes under a client.
+ */
+public final class OpsNode extends Node {
+
+    private static final String TAG = "ops";
+    /** Default cap on how fast one channel is streamed to one client. */
+    private static final double DEFAULT_MAX_HZ = 20.0;
+    /** How long a teleop command is held before it is treated as abandoned. */
+    private static final double TELEOP_HOLD_SECONDS = 0.3;
+
+    /** The velocity command produced by whoever is driving through the API. */
+    public final Out<Twist2> cmdVel = out("cmd_vel", Twist2.class);
+
+    private final int port;
+    private final Supplier<Graph> graphSupplier;
+    private final AssetSource assets;
+    private final HttpServer server;
+    private final List<Client> clients = new ArrayList<>();
+
+    private Node.Context ctx;
+    private volatile Twist2 teleop = Twist2.ZERO;
+    private volatile long teleopUntilNanos;
+    private volatile Runnable onMotorsOn;
+    private volatile Runnable onMotorsOff;
+    private volatile Runnable onEmergencyStop;
+    private volatile Runnable onResetOdometry;
+
+    /** Supplies the web UI's files, so the same code serves an APK or a directory. */
+    public interface AssetSource {
+        /** Bytes for {@code path}, or null when absent. */
+        byte[] read(String path);
+    }
+
+    public OpsNode(int port, Supplier<Graph> graphSupplier) {
+        this(port, graphSupplier, null);
+    }
+
+    public OpsNode(int port, Supplier<Graph> graphSupplier, AssetSource assets) {
+        super("ops");
+        this.port = port;
+        this.graphSupplier = graphSupplier;
+        this.assets = assets;
+        this.server = new HttpServer(port);
+    }
+
+    /** Wires the base's controls, which are actions rather than channel values. */
+    public OpsNode withBaseControls(Runnable motorsOn, Runnable motorsOff,
+                                    Runnable emergencyStop, Runnable resetOdometry) {
+        this.onMotorsOn = motorsOn;
+        this.onMotorsOff = motorsOff;
+        this.onEmergencyStop = emergencyStop;
+        this.onResetOdometry = resetOdometry;
+        return this;
+    }
+
+    /** Where the API is reachable, for the console to display. */
+    public String address() {
+        return HttpServer.localAddress() + ":" + port;
+    }
+
+    public int clientCount() {
+        synchronized (clients) {
+            return clients.size();
+        }
+    }
+
+    @Override public void start(Node.Context context) throws Exception {
+        this.ctx = context;
+        MessageEncoders.installDefaults();
+
+        server.route("/api/nodes", r -> HttpServer.Response.json(nodesJson()));
+        server.route("/api/channels", r -> HttpServer.Response.json(channelsJson()));
+        server.route("/api/channel", r -> channelJson(r.text("name", null)));
+        server.route("/api/drive", this::drive);
+        server.route("/api/stop", r -> {
+            hold(Twist2.ZERO);
+            return HttpServer.Response.text("stopped\n");
+        });
+        server.route("/api/estop", r -> {
+            hold(Twist2.ZERO);
+            run(onEmergencyStop);
+            return HttpServer.Response.text("emergency stop\n");
+        });
+        server.route("/api/motors", r -> {
+            boolean on = r.flag("on", true);
+            run(on ? onMotorsOn : onMotorsOff);
+            return HttpServer.Response.text("motors " + (on ? "on" : "off") + "\n");
+        });
+        server.route("/api/reset", r -> {
+            run(onResetOdometry);
+            return HttpServer.Response.text("odometry reset\n");
+        });
+        server.upgrade("/ws", this::onUpgrade);
+        server.fallback(this::asset);
+        server.start();
+    }
+
+    @Override public void tick(Node.Context context) {
+        long now = context.clock().now().nanos();
+        Twist2 command = teleop;
+        if (command.isZero() && now > teleopUntilNanos) {
+            // Nothing to say. Publishing a zero forever would mask a planner that
+            // has stopped, and the base driver's own timeout is the better judge.
+            return;
+        }
+        if (now > teleopUntilNanos) {
+            // The held command expired: a browser tab closed, or the link dropped
+            // mid-drive. One zero, then silence.
+            teleop = Twist2.ZERO;
+            cmdVel.publish(Twist2.ZERO);
+            return;
+        }
+        // Republished every tick, so a single dropped message cannot leave the
+        // base holding a stale velocity.
+        cmdVel.publish(command);
+    }
+
+    @Override public void stop() {
+        synchronized (clients) {
+            for (Client c : new ArrayList<>(clients)) {
+                c.close();
+            }
+            clients.clear();
+        }
+        server.stop();
+    }
+
+    // ---------- HTTP ----------
+
+    private HttpServer.Response drive(HttpServer.Request r) {
+        // Metres and radians internally, but someone typing a URL thinks in mm/s
+        // and deg/s, which is also what the robot's manual uses. Accept both.
+        double linear = r.number("v", Double.NaN);
+        double angular = r.number("w", Double.NaN);
+        if (!Double.isNaN(r.number("mm", Double.NaN))) {
+            linear = r.number("mm", 0) / 1000.0;
+        }
+        if (!Double.isNaN(r.number("deg", Double.NaN))) {
+            angular = Angles.toRadians(r.number("deg", 0));
+        }
+        Twist2 command = Twist2.of(Double.isNaN(linear) ? 0 : linear,
+                Double.isNaN(angular) ? 0 : angular);
+        hold(command);
+        return HttpServer.Response.text(String.format(
+                "drive %.3f m/s (%.0f mm/s), %.3f rad/s (%.1f deg/s)%n",
+                command.linearX, command.linearX * 1000,
+                command.angular, Angles.toDegrees(command.angular)));
+    }
+
+    /** Holds a command briefly, so a lost client cannot leave it set. */
+    private void hold(Twist2 command) {
+        teleop = command;
+        Node.Context c = ctx;
+        if (c != null) {
+            teleopUntilNanos = c.clock().now().nanos() + (long) (TELEOP_HOLD_SECONDS * 1e9);
+        }
+    }
+
+    private static void run(Runnable action) {
+        if (action != null) {
+            action.run();
+        }
+    }
+
+    private String nodesJson() {
+        Graph g = graphSupplier.get();
+        if (g == null) {
+            return "{\"running\":false}";
+        }
+        StringBuilder sb = new StringBuilder("{\"running\":").append(g.isRunning())
+                .append(",\"loops\":").append(g.loopCount())
+                .append(",\"overruns\":").append(g.overruns())
+                .append(",\"clients\":").append(clientCount())
+                .append(",\"nodes\":[");
+        List<Graph.NodeInfo> nodes = g.nodes();
+        for (int i = 0; i < nodes.size(); i++) {
+            Graph.NodeInfo n = nodes.get(i);
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append("{\"name\":").append(Json.quote(n.name))
+              .append(",\"hz\":").append(String.format("%.1f", n.rate.hz()))
+              .append(",\"ticks\":").append(n.ticks)
+              .append(",\"missed\":").append(n.missed)
+              .append(",\"errors\":").append(n.errors)
+              .append(",\"started\":").append(n.started)
+              .append('}');
+        }
+        return sb.append("]}").toString();
+    }
+
+    private String channelsJson() {
+        Graph g = graphSupplier.get();
+        if (g == null) {
+            return "{\"channels\":[]}";
+        }
+        StringBuilder sb = new StringBuilder("{\"channels\":[");
+        boolean first = true;
+        for (Channel<?> ch : g.channels().values()) {
+            if (!first) {
+                sb.append(',');
+            }
+            first = false;
+            appendChannelInfo(sb, ch);
+        }
+        return sb.append("]}").toString();
+    }
+
+    private static void appendChannelInfo(StringBuilder sb, Channel<?> ch) {
+        sb.append("{\"name\":").append(Json.quote(ch.name()))
+          .append(",\"type\":").append(Json.quote(ch.type().getSimpleName()))
+          .append(",\"published\":").append(ch.published())
+          .append(",\"readers\":").append(ch.readerCount())
+          .append('}');
+    }
+
+    private HttpServer.Response channelJson(String name) {
+        if (name == null) {
+            return HttpServer.Response.error(400, "usage: /api/channel?name=base.odom");
+        }
+        Graph g = graphSupplier.get();
+        if (g == null) {
+            return HttpServer.Response.error(503, "graph not running");
+        }
+        Channel<?> ch = g.channel(name);
+        if (ch == null) {
+            return HttpServer.Response.notFound("no such channel: " + name);
+        }
+        Message<?> latest = ch.latest();
+        if (latest == null) {
+            return HttpServer.Response.json(
+                    "{\"name\":" + Json.quote(name) + ",\"value\":null}");
+        }
+        return HttpServer.Response.json("{\"name\":" + Json.quote(name)
+                + ",\"stampNanos\":" + latest.stamp().nanos()
+                + ",\"seq\":" + latest.sequence()
+                + ",\"value\":" + Json.encode(latest.payload()) + "}");
+    }
+
+    private HttpServer.Response asset(HttpServer.Request r) {
+        String path = "/".equals(r.path) ? "/index.html" : r.path;
+        if (path.contains("..")) {
+            return HttpServer.Response.error(400, "bad path");
+        }
+        if (assets != null) {
+            byte[] body = assets.read(path.substring(1));
+            if (body != null) {
+                return HttpServer.Response.bytes(contentType(path), body);
+            }
+        }
+        return HttpServer.Response.notFound("not found: " + r.path);
+    }
+
+    private static String contentType(String path) {
+        if (path.endsWith(".html")) {
+            return "text/html";
+        }
+        if (path.endsWith(".js")) {
+            return "application/javascript";
+        }
+        if (path.endsWith(".css")) {
+            return "text/css";
+        }
+        if (path.endsWith(".json")) {
+            return "application/json";
+        }
+        if (path.endsWith(".png")) {
+            return "image/png";
+        }
+        return "application/octet-stream";
+    }
+
+    // ---------- WebSocket ----------
+
+    private void onUpgrade(Socket socket, HttpServer.Request request,
+                           Map<String, String> headers) {
+        WebSocket ws;
+        try {
+            ws = WebSocket.accept(socket, headers);
+        } catch (IOException e) {
+            Log.w(TAG, "handshake failed: " + e.getMessage(), null);
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // Already gone.
+            }
+            return;
+        }
+
+        Client client = new Client(ws);
+        synchronized (clients) {
+            clients.add(client);
+        }
+        Log.i(TAG, "client connected (" + clientCount() + " total)");
+        try {
+            Graph g = graphSupplier.get();
+            if (g != null) {
+                // The catalogue immediately, and it is complete and final: every
+                // channel exists before anything runs.
+                client.send(catalogue(g));
+            }
+            String raw;
+            while ((raw = ws.receive()) != null) {
+                try {
+                    handle(client, raw);
+                } catch (RuntimeException e) {
+                    // Never silently drop a connection over one bad message.
+                    Log.w(TAG, "message handling failed: " + e, null);
+                    client.send(error("HANDLER_FAILED", String.valueOf(e.getMessage())));
+                }
+            }
+        } catch (IOException e) {
+            Log.d(TAG, "client read ended: " + e.getMessage());
+        } catch (RuntimeException e) {
+            Log.e(TAG, "client loop failed", e);
+        } finally {
+            client.close();
+            synchronized (clients) {
+                clients.remove(client);
+            }
+            Log.i(TAG, "client disconnected (" + clientCount() + " remaining)");
+        }
+    }
+
+    private void handle(Client client, String raw) {
+        Map<String, Object> message = Json.parseObject(raw);
+        String type = String.valueOf(message.get("type"));
+        Map<String, Object> payload = asMap(message.get("payload"));
+
+        switch (type) {
+            case "subscribe":
+                subscribe(client, payload);
+                break;
+            case "unsubscribe":
+                for (String name : asStrings(payload.get("channels"))) {
+                    client.unsubscribe(name);
+                }
+                break;
+            case "drive":
+                hold(Twist2.of(number(payload.get("linearX")), number(payload.get("angular"))));
+                break;
+            case "estop":
+                hold(Twist2.ZERO);
+                run(onEmergencyStop);
+                break;
+            case "ping":
+                client.send("{\"type\":\"pong\",\"payload\":{}}");
+                break;
+            default:
+                client.send(error("UNKNOWN_TYPE", "no such message type: " + type));
+        }
+    }
+
+    private void subscribe(Client client, Map<String, Object> payload) {
+        Graph g = graphSupplier.get();
+        if (g == null) {
+            client.send(error("NOT_RUNNING", "graph is not running"));
+            return;
+        }
+        double maxHz = payload.get("maxHz") instanceof Number
+                ? ((Number) payload.get("maxHz")).doubleValue()
+                : DEFAULT_MAX_HZ;
+
+        StringBuilder snapshot =
+                new StringBuilder("{\"type\":\"snapshot\",\"payload\":{\"channels\":[");
+        boolean first = true;
+        for (String name : asStrings(payload.get("channels"))) {
+            Channel<?> ch = g.channel(name);
+            if (ch == null) {
+                client.send(error("NO_SUCH_CHANNEL", name));
+                continue;
+            }
+            client.subscribe(ch, maxHz);
+            Message<?> latest = ch.latest();
+            if (latest != null) {
+                if (!first) {
+                    snapshot.append(',');
+                }
+                first = false;
+                appendMessage(snapshot, ch.name(), latest);
+            }
+        }
+        client.send(snapshot.append("]}}").toString());
+    }
+
+    private String catalogue(Graph g) {
+        StringBuilder sb = new StringBuilder("{\"type\":\"channels\",\"payload\":{\"channels\":[");
+        boolean first = true;
+        for (Channel<?> ch : g.channels().values()) {
+            if (!first) {
+                sb.append(',');
+            }
+            first = false;
+            appendChannelInfo(sb, ch);
+        }
+        return sb.append("]}}").toString();
+    }
+
+    private static void appendMessage(StringBuilder sb, String name, Message<?> m) {
+        sb.append("{\"channel\":").append(Json.quote(name))
+          .append(",\"stampNanos\":").append(m.stamp().nanos())
+          .append(",\"seq\":").append(m.sequence())
+          .append(",\"value\":").append(Json.encode(m.payload()))
+          .append('}');
+    }
+
+    private static String error(String code, String message) {
+        return "{\"type\":\"error\",\"payload\":{\"code\":" + Json.quote(code)
+                + ",\"message\":" + Json.quote(String.valueOf(message)) + "}}";
+    }
+
+    private static double number(Object value) {
+        return value instanceof Number ? ((Number) value).doubleValue() : 0;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> asMap(Object o) {
+        return o instanceof Map ? (Map<String, Object>) o : new HashMap<>();
+    }
+
+    private static List<String> asStrings(Object o) {
+        List<String> out = new ArrayList<>();
+        if (o instanceof List) {
+            for (Object item : (List<?>) o) {
+                out.add(String.valueOf(item));
+            }
+        } else if (o instanceof String) {
+            out.add((String) o);
+        }
+        return out;
+    }
+
+    /**
+     * One connected viewer.
+     *
+     * <p>Messages are queued and written by a thread of the client's own. The
+     * channel listener runs on whichever thread published — for odometry that is
+     * the serial driver's callback thread — and writing to a socket there let one
+     * stalled viewer block the drive base and kill the app.
+     */
+    private static final class Client {
+
+        private static final int OUTBOX_DEPTH = 256;
+        /** Tells the sender thread to finish. Not a message anything would send. */
+        private static final String POISON = "__antu_close__";
+
+        private final WebSocket ws;
+        private final Map<String, Runnable> detach = new ConcurrentHashMap<>();
+        private final BlockingQueue<String> outbox = new ArrayBlockingQueue<>(OUTBOX_DEPTH);
+        private final Thread sender;
+        private volatile boolean closing;
+
+        Client(WebSocket ws) {
+            this.ws = ws;
+            this.sender = new Thread(this::drain, "antu-ws-send");
+            this.sender.setDaemon(true);
+            this.sender.start();
+        }
+
+        private void drain() {
+            try {
+                while (!closing) {
+                    String message = outbox.take();
+                    if (POISON.equals(message)) {
+                        return;
+                    }
+                    ws.send(message);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (IOException e) {
+                Log.d(TAG, "send failed, dropping client: " + e.getMessage());
+            } finally {
+                ws.close();
+            }
+        }
+
+        <T> void subscribe(Channel<T> channel, double maxHz) {
+            unsubscribe(channel.name());
+            long minGapNanos = maxHz <= 0 ? 0 : (long) (1e9 / maxHz);
+            long[] lastSentNanos = {Long.MIN_VALUE};
+
+            Channel.Listener<T> listener = m -> {
+                long stamp = m.stamp().nanos();
+                synchronized (lastSentNanos) {
+                    if (stamp - lastSentNanos[0] < minGapNanos) {
+                        return;                  // dropped by the rate limit
+                    }
+                    lastSentNanos[0] = stamp;
+                }
+                StringBuilder sb = new StringBuilder("{\"type\":\"msg\",\"payload\":");
+                appendMessage(sb, channel.name(), m);
+                send(sb.append('}').toString());
+            };
+            channel.addListener(listener);
+            detach.put(channel.name(), () -> channel.removeListener(listener));
+        }
+
+        void unsubscribe(String name) {
+            Runnable r = detach.remove(name);
+            if (r != null) {
+                r.run();
+            }
+        }
+
+        /** Never blocks. A viewer that cannot keep up loses the oldest messages. */
+        void send(String message) {
+            if (closing) {
+                return;
+            }
+            while (!outbox.offer(message)) {
+                outbox.poll();
+            }
+        }
+
+        void close() {
+            if (closing) {
+                return;
+            }
+            closing = true;
+            for (Runnable r : detach.values()) {
+                r.run();
+            }
+            detach.clear();
+            outbox.clear();
+            outbox.offer(POISON);
+            sender.interrupt();
+            ws.close();
+        }
+    }
+}

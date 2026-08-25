@@ -1,311 +1,425 @@
 package com.antu.core;
 
-import com.antu.core.bus.Topic;
-import com.antu.core.exec.Graph;
-import com.antu.core.node.AbstractNode;
+import com.antu.core.graph.Graph;
+import com.antu.core.graph.In;
+import com.antu.core.graph.Message;
+import com.antu.core.graph.Out;
 import com.antu.core.node.Node;
+import com.antu.core.time.Clock;
 import com.antu.core.time.ManualClock;
 import com.antu.core.time.Rate;
 
 import java.util.ArrayList;
 import java.util.List;
 
-/** Scheduling, rate division, isolation, and reproducibility. */
+/**
+ * The static graph, and the guarantees it is supposed to buy.
+ *
+ * <p>Type mismatches are absent from this file on purpose: {@code connect} is
+ * generic, so wiring an {@code Out<Integer>} to an {@code In<String>} does not
+ * compile and cannot be asserted at runtime. That is the point of the design —
+ * the errors these tests do cover are the ones a type cannot express.
+ */
 public final class GraphTest {
-
-    private static final Topic<Integer> TICKS = Topic.of("/ticks", Integer.class);
 
     public static void main(String[] args) throws Exception {
         Check c = new Check("GraphTest");
 
+        dataCrossesTheGraphInOneTick(c);
+        orderIgnoresInsertion(c);
+        missingRequiredInputFails(c);
+        optionalInputMayDangle(c);
+        twoWritersFail(c);
+        directCycleFails(c);
+        delayedEdgeBreaksTheCycle(c);
+        autoconnectMatchesNameAndType(c);
+        autoconnectRefusesAmbiguity(c);
+        everyProblemIsReportedAtOnce(c);
         ratesDivide(c);
-        declaredOrderIsExecutionOrder(c);
-        queuedMessagesArriveBeforeTick(c);
-        orderDecidesLatency(c);
-        aFailingNodeDoesNotStopTheGraph(c);
-        stopUnsubscribes(c);
-        duplicateNamesRejected(c);
-        replayIsDeterministic(c);
-        jitterDoesNotDropTicks(c);
-        aSlowNodeGivesUpSlotsRatherThanBursting(c);
-        aNodeThatFailsToStartIsSkipped(c);
+        freshnessAndDrain(c);
+        aFailingNodeIsIsolated(c);
+        determinism(c);
+        everyOutputGetsAChannel(c);
 
         c.finish();
     }
 
-    /** A node that records when it ran. */
-    private static final class Recorder extends AbstractNode {
-        final List<Long> ticksAt = new ArrayList<>();
-        final List<Integer> received = new ArrayList<>();
-        final List<String> trace;
-        boolean publishes;
-        boolean throwsOnTick;
-        boolean throwsOnStart;
-        /** Milliseconds of clock time to burn in tick(), to simulate an overrun. */
-        long overrunMillis;
-        ManualClock burnClock;
+    // ---------- fixtures ----------
 
-        Recorder(String name, List<String> trace) {
+    /** Publishes an incrementing counter. */
+    private static final class Source extends Node {
+        final Out<Integer> value = out("value", Integer.class);
+        final List<String> trace;
+        int n;
+
+        Source(String name, List<String> trace) {
             super(name);
             this.trace = trace;
         }
 
-        @Override public void start(Node.Context ctx) {
+        @Override public void tick(Context ctx) {
+            trace.add(name());
+            value.publish(++n);
+        }
+    }
+
+    /** Reads a counter and republishes it, so chains can be built. */
+    private static final class Relay extends Node {
+        final In<Integer> input = in("value", Integer.class, 0);
+        final Out<Integer> output = out("relayed", Integer.class);
+        final List<String> trace;
+        final List<Integer> seen = new ArrayList<>();
+        boolean throwsOnTick;
+        boolean throwsOnStart;
+
+        Relay(String name, List<String> trace) {
+            super(name);
+            this.trace = trace;
+        }
+
+        @Override public void start(Context ctx) {
             if (throwsOnStart) {
                 throw new IllegalStateException("deliberate start failure");
             }
-            ctx.subscribe(TICKS, m -> received.add(m.payload()));
         }
 
-        @Override public void tick(Node.Context ctx) {
+        @Override public void tick(Context ctx) {
             trace.add(name());
-            ticksAt.add(ctx.clock().now().millis());
-            if (overrunMillis > 0 && burnClock != null) {
-                burnClock.advanceMillis(overrunMillis);
-            }
             if (throwsOnTick) {
                 throw new IllegalStateException("deliberate");
             }
-            if (publishes) {
-                ctx.publish(TICKS, (int) ctx.tickCount());
-            }
+            seen.add(input.get());
+            output.publish(input.get());
         }
     }
 
-    private static void ratesDivide(Check c) throws Exception {
-        ManualClock clock = new ManualClock();
-        Graph g = new Graph(clock);
-        List<String> trace = new ArrayList<>();
-        Recorder fast = new Recorder("fast", trace);
-        Recorder slow = new Recorder("slow", trace);
-        g.add(fast, Rate.hz(100));      // every 10 ms
-        g.add(slow, Rate.hz(10));       // every 100 ms
-        g.start();
-        g.step(100);                    // loop runs at the fastest rate: 100 x 10 ms
-        g.stop();
+    /** Terminal consumer. */
+    private static final class Sink extends Node {
+        final In<Integer> input = in("relayed", Integer.class, 0);
+        final List<String> trace;
+        final List<Integer> seen = new ArrayList<>();
+        final List<Integer> drained = new ArrayList<>();
+        boolean useDrain;
 
-        // A 100 Hz filter and a 10 Hz planner share one thread with no coordination.
-        c.eq("rates: fast ticked every loop", 100, fast.ticksAt.size());
-        c.eq("rates: slow ticked a tenth as often", 10, slow.ticksAt.size());
-        c.eq("rates: slow spaced 100ms apart", 100L,
-                slow.ticksAt.get(1) - slow.ticksAt.get(0));
+        Sink(String name, List<String> trace) {
+            super(name);
+            this.trace = trace;
+        }
+
+        @Override public void tick(Context ctx) {
+            trace.add(name());
+            if (useDrain) {
+                for (Message<Integer> m : input.drain()) {
+                    drained.add(m.payload());
+                }
+            }
+            seen.add(input.get());
+        }
     }
 
-    private static void declaredOrderIsExecutionOrder(Check c) throws Exception {
-        ManualClock clock = new ManualClock();
-        Graph g = new Graph(clock);
+    // ---------- ordering ----------
+
+    /**
+     * A value published by the first node reaches the last within the same tick.
+     * With declaration-order scheduling this took three ticks, and nothing said so.
+     */
+    private static void dataCrossesTheGraphInOneTick(Check c) throws Exception {
         List<String> trace = new ArrayList<>();
-        g.add(new Recorder("first", trace), Rate.hz(10));
-        g.add(new Recorder("second", trace), Rate.hz(10));
-        g.add(new Recorder("third", trace), Rate.hz(10));
+        Source source = new Source("source", trace);
+        Relay relay = new Relay("relay", trace);
+        Sink sink = new Sink("sink", trace);
+
+        Graph g = Graph.builder(new ManualClock())
+                .add(sink, Rate.hz(10))          // added first, on purpose
+                .add(relay, Rate.hz(10))
+                .add(source, Rate.hz(10))
+                .connect(source.value, relay.input)
+                .connect(relay.output, sink.input)
+                .build();
+        g.start();
+        g.step(1);
+        g.stop();
+
+        c.eq("one tick: source ran first", "[source, relay, sink]", trace.toString());
+        c.eq("one tick: value reached the end", "[1]", sink.seen.toString());
+    }
+
+    private static void orderIgnoresInsertion(Check c) throws Exception {
+        List<String> a = new ArrayList<>();
+        List<String> b = new ArrayList<>();
+        c.eq("order: independent of insertion", run(a, true), run(b, false));
+    }
+
+    private static String run(List<String> trace, boolean sourceFirst) throws Exception {
+        Source source = new Source("source", trace);
+        Relay relay = new Relay("relay", trace);
+        Graph.Builder builder = Graph.builder(new ManualClock());
+        if (sourceFirst) {
+            builder.add(source, Rate.hz(10)).add(relay, Rate.hz(10));
+        } else {
+            builder.add(relay, Rate.hz(10)).add(source, Rate.hz(10));
+        }
+        Graph g = builder.connect(source.value, relay.input).build();
         g.start();
         g.step(2);
         g.stop();
-
-        // Insertion order, every loop. Putting a filter ahead of the planner that
-        // consumes it therefore saves a whole cycle of latency.
-        c.eq("order: follows insertion", "[first, second, third, first, second, third]",
-                trace.toString());
+        return trace.toString();
     }
 
-    private static void queuedMessagesArriveBeforeTick(Check c) throws Exception {
-        ManualClock clock = new ManualClock();
-        Graph g = new Graph(clock);
+    // ---------- validation ----------
+
+    private static void missingRequiredInputFails(Check c) {
         List<String> trace = new ArrayList<>();
-        Recorder producer = new Recorder("producer", trace);
-        producer.publishes = true;
-        Recorder consumer = new Recorder("consumer", trace);
-        g.add(producer, Rate.hz(10));
-        g.add(consumer, Rate.hz(10));
+        try {
+            Graph.builder(new ManualClock())
+                    .add(new Relay("relay", trace), Rate.hz(10))
+                    .build();
+            c.fail("missing input: should have failed");
+        } catch (IllegalStateException e) {
+            // A graph missing a wire must not run: a node that silently never
+            // receives anything looks exactly like a broken sensor.
+            c.eq("missing input: names the port", true, e.getMessage().contains("relay.value"));
+        }
+    }
+
+    private static void optionalInputMayDangle(Check c) throws Exception {
+        List<String> trace = new ArrayList<>();
+        Relay relay = new Relay("relay", trace);
+        relay.input.optional();
+        Graph g = Graph.builder(new ManualClock()).add(relay, Rate.hz(10)).build();
+        g.start();
+        g.step(1);
+        g.stop();
+        c.eq("optional input: falls back", "[0]", relay.seen.toString());
+    }
+
+    private static void twoWritersFail(Check c) {
+        List<String> trace = new ArrayList<>();
+        Source a = new Source("a", trace);
+        Source b = new Source("b", trace);
+        Relay relay = new Relay("relay", trace);
+        try {
+            Graph.builder(new ManualClock())
+                    .add(a, Rate.hz(10)).add(b, Rate.hz(10)).add(relay, Rate.hz(10))
+                    .connect(a.value, relay.input)
+                    .connect(b.value, relay.input)
+                    .build();
+            c.fail("two writers: should have failed");
+        } catch (IllegalStateException e) {
+            // Teleop and a planner both driving cmd_vel makes a robot stutter
+            // between two commands. Caught before it moves, not warned about.
+            c.eq("two writers: reports both", true,
+                    e.getMessage().contains("a.value") && e.getMessage().contains("b.value"));
+        }
+    }
+
+    // ---------- cycles ----------
+
+    private static void directCycleFails(Check c) {
+        List<String> trace = new ArrayList<>();
+        Relay one = new Relay("one", trace);
+        Relay two = new Relay("two", trace);
+        try {
+            Graph.builder(new ManualClock())
+                    .add(one, Rate.hz(10)).add(two, Rate.hz(10))
+                    .connect(one.output, two.input)
+                    .connect(two.output, one.input)
+                    .build();
+            c.fail("cycle: should have failed");
+        } catch (IllegalStateException e) {
+            c.eq("cycle: names the nodes", true,
+                    e.getMessage().contains("one") && e.getMessage().contains("two"));
+            c.eq("cycle: suggests the fix", true,
+                    e.getMessage().contains("connectDelayed"));
+        }
+    }
+
+    /** A control loop is inherently cyclic; the feedback edge makes it schedulable. */
+    private static void delayedEdgeBreaksTheCycle(Check c) throws Exception {
+        List<String> trace = new ArrayList<>();
+        Relay controller = new Relay("controller", trace);
+        Relay plant = new Relay("plant", trace);
+
+        Graph g = Graph.builder(new ManualClock())
+                .add(controller, Rate.hz(10)).add(plant, Rate.hz(10))
+                .connect(controller.output, plant.input)
+                .connectDelayed(plant.output, controller.input)   // feedback
+                .build();
         g.start();
         g.step(3);
         g.stop();
 
-        // Same loop, not the next one: the consumer is declared after the producer,
-        // so by the time its queues are drained the producer has already published.
-        // Declaration order is worth a full cycle of latency, which is why it is
-        // insertion order rather than something the scheduler is free to choose.
-        c.eq("delivery: consumer saw the publisher", "[0, 1, 2]", consumer.received.toString());
+        c.eq("feedback: controller runs before the plant", "controller", trace.get(0));
+        c.eq("feedback: loop actually ran", 3, plant.seen.size());
     }
 
-    /**
-     * A node whose start() throws is skipped, and the rest of the graph runs. An
-     * ops server whose port is taken is no reason for a drive base to stay dead.
-     */
-    private static void aNodeThatFailsToStartIsSkipped(Check c) throws Exception {
-        ManualClock clock = new ManualClock();
-        Graph g = new Graph(clock);
+    // ---------- autoconnect ----------
+
+    private static void autoconnectMatchesNameAndType(Check c) throws Exception {
         List<String> trace = new ArrayList<>();
-        Recorder broken = new Recorder("broken", trace);
-        broken.throwsOnStart = true;
-        Recorder healthy = new Recorder("healthy", trace);
-        g.add(broken, Rate.hz(10));
-        g.add(healthy, Rate.hz(10));
+        Source source = new Source("source", trace);
+        Relay relay = new Relay("relay", trace);      // its input is also called "value"
+
+        Graph g = Graph.builder(new ManualClock())
+                .add(source, Rate.hz(10)).add(relay, Rate.hz(10))
+                .autoconnect()
+                .build();
+        g.start();
+        g.step(1);
+        g.stop();
+        c.eq("autoconnect: wired by name and type", "[1]", relay.seen.toString());
+    }
+
+    private static void autoconnectRefusesAmbiguity(Check c) {
+        List<String> trace = new ArrayList<>();
+        try {
+            Graph.builder(new ManualClock())
+                    .add(new Source("a", trace), Rate.hz(10))
+                    .add(new Source("b", trace), Rate.hz(10))
+                    .add(new Relay("relay", trace), Rate.hz(10))
+                    .autoconnect()
+                    .build();
+            c.fail("ambiguous autoconnect: should have failed");
+        } catch (IllegalStateException e) {
+            // Guessing which of two sources feeds an input is exactly the kind of
+            // silent choice that makes a system unpredictable.
+            c.eq("ambiguous autoconnect: says so", true,
+                    e.getMessage().contains("ambiguous"));
+        }
+    }
+
+    private static void everyProblemIsReportedAtOnce(Check c) {
+        List<String> trace = new ArrayList<>();
+        Source a = new Source("a", trace);
+        Source b = new Source("b", trace);
+        Relay relay = new Relay("relay", trace);
+        Sink sink = new Sink("sink", trace);
+        try {
+            Graph.builder(new ManualClock())
+                    .add(a, Rate.hz(10)).add(b, Rate.hz(10))
+                    .add(relay, Rate.hz(10)).add(sink, Rate.hz(10))
+                    .connect(a.value, relay.input)
+                    .connect(b.value, relay.input)      // two writers
+                    .build();                            // and sink.relayed unwired
+            c.fail("multiple problems: should have failed");
+        } catch (IllegalStateException e) {
+            // Fixing a half-wired graph one build at a time is miserable.
+            c.eq("multiple problems: reports both", true,
+                    e.getMessage().contains("writers") && e.getMessage().contains("sink.relayed"));
+        }
+    }
+
+    // ---------- scheduling ----------
+
+    private static void ratesDivide(Check c) throws Exception {
+        List<String> trace = new ArrayList<>();
+        Source fast = new Source("fast", trace);
+        Relay slow = new Relay("slow", trace);
+        Graph g = Graph.builder(new ManualClock())
+                .add(fast, Rate.hz(100)).add(slow, Rate.hz(10))
+                .connect(fast.value, slow.input)
+                .build();
+        g.start();
+        g.step(100);
+        g.stop();
+        c.eq("rates: fast ticked every loop", 100, fast.n);
+        c.eq("rates: slow ticked a tenth as often", 10, slow.seen.size());
+    }
+
+    private static void freshnessAndDrain(Check c) throws Exception {
+        List<String> trace = new ArrayList<>();
+        Source source = new Source("source", trace);
+        Relay relay = new Relay("relay", trace);
+        Sink sink = new Sink("sink", trace);
+        sink.useDrain = true;
+
+        Graph g = Graph.builder(new ManualClock())
+                .add(source, Rate.hz(100)).add(relay, Rate.hz(100)).add(sink, Rate.hz(20))
+                .connect(source.value, relay.input)
+                .connect(relay.output, sink.input)
+                .build();
+        g.start();
+        g.step(20);
+        g.stop();
+
+        // get() gives the latest and skips; drain() loses nothing. A node
+        // integrating distance must use drain or it under-reports.
+        //
+        // The sink ticks at loops 0, 5, 10 and 15, so it has drained 16 of the 20
+        // published; the last four are still queued, not dropped. That distinction
+        // is the whole point, so assert it rather than the total.
+        c.eq("drain: nothing dropped", 0L, sink.input.dropped());
+        c.eq("drain: everything up to the last tick", 16, sink.drained.size());
+        c.eq("get: only the latest per tick", 4, sink.seen.size());
+
+        // And the tail is still there to be collected.
+        c.eq("drain: the rest is queued, not lost", 4, sink.input.drain().size());
+    }
+
+    private static void aFailingNodeIsIsolated(Check c) throws Exception {
+        List<String> trace = new ArrayList<>();
+        Source source = new Source("source", trace);
+        Relay bad = new Relay("bad", trace);
+        bad.throwsOnTick = true;
+        Relay good = new Relay("good", trace);
 
         com.antu.core.log.Log.setSink(com.antu.core.log.Log.NONE);
+        Graph g = Graph.builder(new ManualClock())
+                .add(source, Rate.hz(10)).add(bad, Rate.hz(10)).add(good, Rate.hz(10))
+                .connect(source.value, bad.input)
+                .connect(source.value, good.input)
+                .build();
         g.start();
         g.step(5);
         g.stop();
         com.antu.core.log.Log.setSink(com.antu.core.log.Log.CONSOLE);
 
-        c.eq("start failure: healthy node ran", 5, healthy.ticksAt.size());
-        c.eq("start failure: broken node never ticked", 0, broken.ticksAt.size());
-        c.eq("start failure: reported as not started", false, g.nodes().get(0).started);
-        c.eq("start failure: counted as an error", 1L, g.nodes().get(0).errors);
+        c.eq("isolation: healthy node kept running", 5, good.seen.size());
+        c.eq("isolation: errors counted", 5L, g.nodes().get(1).errors);
     }
 
-    /** The mirror image: declared before the producer, the consumer waits a cycle. */
-    private static void orderDecidesLatency(Check c) throws Exception {
-        ManualClock clock = new ManualClock();
-        Graph g = new Graph(clock);
-        List<String> trace = new ArrayList<>();
-        Recorder consumer = new Recorder("consumer", trace);
-        Recorder producer = new Recorder("producer", trace);
-        producer.publishes = true;
-        g.add(consumer, Rate.hz(10));   // declared first, so it ticks first
-        g.add(producer, Rate.hz(10));
-        g.start();
-        g.step(3);
-        g.stop();
-
-        // One loop behind: it drained before the producer had published.
-        c.eq("latency: wrong order costs a cycle", "[0, 1]", consumer.received.toString());
+    private static void determinism(Check c) throws Exception {
+        c.eq("determinism: run 2 matches run 1", once(), once());
+        c.eq("determinism: run 3 matches run 1", once(), once());
     }
 
-    private static void aFailingNodeDoesNotStopTheGraph(Check c) throws Exception {
-        ManualClock clock = new ManualClock();
-        Graph g = new Graph(clock);
+    /**
+     * Telemetry depends on this: sonar and battery usually have no consumer in the
+     * graph and are still exactly what an operator needs to watch.
+     */
+    private static void everyOutputGetsAChannel(Check c) throws Exception {
         List<String> trace = new ArrayList<>();
-        Recorder bad = new Recorder("bad", trace);
-        bad.throwsOnTick = true;
-        Recorder good = new Recorder("good", trace);
-        g.add(bad, Rate.hz(10));
-        g.add(good, Rate.hz(10));
+        Source source = new Source("source", trace);
+        Relay relay = new Relay("relay", trace);
 
-        // A throwing node would otherwise spam the console through the default handler.
-        Thread.currentThread().setUncaughtExceptionHandler((t, e) -> { });
-        g.start();
-        g.step(5);
-        g.stop();
-        Thread.currentThread().setUncaughtExceptionHandler(null);
-
-        // One bad driver must not take the robot down with it.
-        c.eq("isolation: healthy node kept running", 5, good.ticksAt.size());
-        c.eq("isolation: errors counted", 5L, g.nodes().get(0).errors);
-        c.eq("isolation: failed ticks not counted as work", 0L, g.nodes().get(0).ticks);
-    }
-
-    private static void stopUnsubscribes(Check c) throws Exception {
-        ManualClock clock = new ManualClock();
-        Graph g = new Graph(clock);
-        List<String> trace = new ArrayList<>();
-        Recorder r = new Recorder("r", trace);
-        g.add(r, Rate.hz(10));
+        Graph g = Graph.builder(new ManualClock())
+                .add(source, Rate.hz(10)).add(relay, Rate.hz(10))
+                .connect(source.value, relay.input)
+                .build();
         g.start();
         g.step(1);
         g.stop();
 
-        // After stop the listener must be detached, or a restarted graph delivers
-        // to both the old and new instances.
-        g.bus().publish(TICKS, 99);
-        c.eq("stop: listener detached", 0, r.received.size());
+        c.eq("channels: one per output, read or not", 2, g.channels().size());
+        c.eq("channels: the unread one exists", true, g.channel("relay.relayed") != null);
+        c.eq("channels: and carries data", 1L, g.channel("relay.relayed").published());
+        c.eq("channels: readers counted", 1, g.channel("source.value").readerCount());
+        c.eq("channels: unread has none", 0, g.channel("relay.relayed").readerCount());
     }
 
-    private static void duplicateNamesRejected(Check c) {
-        Graph g = new Graph(new ManualClock());
+    private static String once() throws Exception {
         List<String> trace = new ArrayList<>();
-        g.add(new Recorder("dup", trace), Rate.hz(10));
-        try {
-            g.add(new Recorder("dup", trace), Rate.hz(10));
-            c.fail("names: duplicate should be rejected");
-        } catch (IllegalArgumentException e) {
-            c.pass("names: duplicate rejected");
-        }
-    }
-
-    /**
-     * A clock whose sleeps come back slightly short, as a real one does.
-     *
-     * <p>{@link ManualClock} advances by exactly what is asked, so it cannot
-     * reproduce scheduler drift. This one wakes 0.5% early — far less jitter than
-     * an actual phone under load — which was enough to make a 10 Hz node tick at
-     * 6 Hz before the deadlines were advanced in whole periods.
-     */
-    private static final class JitteryClock implements com.antu.core.time.Clock {
-        private final ManualClock inner = new ManualClock();
-
-        @Override public com.antu.core.time.Stamp now() {
-            return inner.now();
-        }
-
-        @Override public void sleepNanos(long nanos) {
-            inner.advanceNanos(Math.max(1, (long) (nanos * 0.995)));
-        }
-    }
-
-    private static void jitterDoesNotDropTicks(Check c) throws Exception {
-        JitteryClock clock = new JitteryClock();
-        Graph g = new Graph(clock);
-        List<String> trace = new ArrayList<>();
-        Recorder n = new Recorder("same-rate", trace);
-        g.add(n, Rate.hz(10));          // the only node, so it runs at the loop rate
-        g.start();
-        g.step(50);
-        g.stop();
-
-        // Every loop, not two out of three.
-        c.eq("jitter: ticks every loop", 50, n.ticksAt.size());
-        c.eq("jitter: nothing recorded as missed", 0L, g.nodes().get(0).missed);
-    }
-
-    private static void aSlowNodeGivesUpSlotsRatherThanBursting(Check c) throws Exception {
-        ManualClock clock = new ManualClock();
-        Graph g = new Graph(clock);
-        List<String> trace = new ArrayList<>();
-        Recorder fast = new Recorder("fast", trace);
-        Recorder slow = new Recorder("slow", trace);
-        slow.burnClock = clock;
-        slow.overrunMillis = 500;       // overruns its 100 ms budget fivefold
-        g.add(fast, Rate.hz(10));
-        g.add(slow, Rate.hz(10));
-        g.start();
-        g.step(10);
-        g.stop();
-
-        // A node that cannot keep up must drop the slots it missed, not fire a
-        // burst of catch-up ticks at a robot with stale sensor data.
-        c.eq("overrun: no catch-up burst", true, slow.ticksAt.size() <= 10);
-        c.eq("overrun: missed slots counted", true, g.nodes().get(1).missed > 0);
-    }
-
-    /**
-     * The architectural bet: same inputs, same execution, every run. Without this
-     * a recording is a rough guide rather than a reproduction, and intermittent
-     * robot bugs stay intermittent.
-     */
-    private static void replayIsDeterministic(Check c) throws Exception {
-        String first = runOnce();
-        String second = runOnce();
-        String third = runOnce();
-        c.eq("determinism: run 2 matches run 1", first, second);
-        c.eq("determinism: run 3 matches run 1", first, third);
-        c.eq("determinism: trace is non-trivial", true, first.length() > 100);
-    }
-
-    private static String runOnce() throws Exception {
-        ManualClock clock = new ManualClock();
-        Graph g = new Graph(clock);
-        List<String> trace = new ArrayList<>();
-        Recorder imu = new Recorder("imu", trace);
-        imu.publishes = true;
-        Recorder filter = new Recorder("filter", trace);
-        Recorder planner = new Recorder("planner", trace);
-        g.add(imu, Rate.hz(200));
-        g.add(filter, Rate.hz(50));
-        g.add(planner, Rate.hz(5));
+        Source source = new Source("source", trace);
+        Relay relay = new Relay("relay", trace);
+        Sink sink = new Sink("sink", trace);
+        Graph g = Graph.builder(new ManualClock())
+                .add(source, Rate.hz(200)).add(relay, Rate.hz(50)).add(sink, Rate.hz(5))
+                .connect(source.value, relay.input)
+                .connect(relay.output, sink.input)
+                .build();
         g.start();
         g.step(200);
         g.stop();
-        return trace.toString() + filter.received.size() + "/" + planner.received.size();
+        return trace.toString() + relay.seen.size() + "/" + sink.seen.size();
     }
 }

@@ -62,6 +62,10 @@ public final class Log {
         write(Level.WARN, tag, message, null);
     }
 
+    public static void w(String tag, String message, Throwable error) {
+        write(Level.WARN, tag, message, error);
+    }
+
     public static void e(String tag, String message) {
         write(Level.ERROR, tag, message, null);
     }

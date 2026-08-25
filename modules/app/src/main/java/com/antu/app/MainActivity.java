@@ -13,8 +13,8 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-import com.antu.core.bus.Bus;
-import com.antu.core.exec.Graph;
+import com.antu.core.graph.Channel;
+import com.antu.core.graph.Graph;
 
 import java.util.Locale;
 
@@ -54,7 +54,7 @@ public final class MainActivity extends Activity {
         root.addView(heading("nodes"));
         nodes = mono();
         root.addView(nodes);
-        root.addView(heading("topics"));
+        root.addView(heading("channels"));
         topics = mono();
         root.addView(topics);
 
@@ -98,10 +98,10 @@ public final class MainActivity extends Activity {
         nodes.setText(n.toString());
 
         StringBuilder t = new StringBuilder();
-        for (Bus.TopicInfo info : g.bus().topics()) {
-            t.append(info).append('\n');
+        for (Channel<?> ch : g.channels().values()) {
+            t.append(ch).append('\n');
         }
-        topics.setText(t.length() == 0 ? "(none published yet)" : t.toString());
+        topics.setText(t.length() == 0 ? "(no channels)" : t.toString());
     }
 
     private TextView heading(String text) {

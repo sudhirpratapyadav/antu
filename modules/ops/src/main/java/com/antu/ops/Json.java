@@ -41,6 +41,187 @@ public final class Json {
 
     private Json() { }
 
+    // ---------- reading ----------
+
+    /**
+     * Parses JSON into plain values: {@code Map<String,Object>}, {@code List},
+     * {@code String}, {@code Double}, {@code Boolean} or null.
+     *
+     * <p>Deliberately untyped. The bridge needs to read a handful of small client
+     * messages, and mapping those onto generated classes would put the wire format
+     * in two places that must be kept in step — the maintenance cost this whole
+     * design is trying to avoid.
+     *
+     * @throws IllegalArgumentException on malformed input
+     */
+    public static Object parse(String text) {
+        Reader r = new Reader(text);
+        r.skipWhitespace();
+        Object value = r.readValue(0);
+        r.skipWhitespace();
+        if (!r.done()) {
+            throw new IllegalArgumentException("trailing content at " + r.pos);
+        }
+        return value;
+    }
+
+    /** {@link #parse} as a map, or an empty map when it is anything else. */
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> parseObject(String text) {
+        Object o = parse(text);
+        return o instanceof Map ? (Map<String, Object>) o : new HashMap<>();
+    }
+
+    /** A small recursive-descent reader. */
+    private static final class Reader {
+        private final String s;
+        private int pos;
+
+        Reader(String s) {
+            this.s = s;
+        }
+
+        boolean done() {
+            return pos >= s.length();
+        }
+
+        void skipWhitespace() {
+            while (pos < s.length() && Character.isWhitespace(s.charAt(pos))) {
+                pos++;
+            }
+        }
+
+        Object readValue(int depth) {
+            if (depth > MAX_DEPTH) {
+                throw new IllegalArgumentException("nested too deeply at " + pos);
+            }
+            skipWhitespace();
+            if (done()) {
+                throw new IllegalArgumentException("unexpected end of input");
+            }
+            char c = s.charAt(pos);
+            switch (c) {
+                case '{': return readObject(depth);
+                case '[': return readArray(depth);
+                case '"': return readString();
+                case 't': expect("true");  return Boolean.TRUE;
+                case 'f': expect("false"); return Boolean.FALSE;
+                case 'n': expect("null");  return null;
+                default:  return readNumber();
+            }
+        }
+
+        Map<String, Object> readObject(int depth) {
+            Map<String, Object> map = new java.util.LinkedHashMap<>();
+            pos++;                                   // past '{'
+            skipWhitespace();
+            if (!done() && s.charAt(pos) == '}') {
+                pos++;
+                return map;
+            }
+            while (true) {
+                skipWhitespace();
+                String key = readString();
+                skipWhitespace();
+                if (done() || s.charAt(pos) != ':') {
+                    throw new IllegalArgumentException("expected ':' at " + pos);
+                }
+                pos++;
+                map.put(key, readValue(depth + 1));
+                skipWhitespace();
+                if (done()) {
+                    throw new IllegalArgumentException("unterminated object");
+                }
+                char c = s.charAt(pos++);
+                if (c == '}') {
+                    return map;
+                }
+                if (c != ',') {
+                    throw new IllegalArgumentException("expected ',' or '}' at " + (pos - 1));
+                }
+            }
+        }
+
+        java.util.List<Object> readArray(int depth) {
+            java.util.List<Object> list = new java.util.ArrayList<>();
+            pos++;                                   // past '['
+            skipWhitespace();
+            if (!done() && s.charAt(pos) == ']') {
+                pos++;
+                return list;
+            }
+            while (true) {
+                list.add(readValue(depth + 1));
+                skipWhitespace();
+                if (done()) {
+                    throw new IllegalArgumentException("unterminated array");
+                }
+                char c = s.charAt(pos++);
+                if (c == ']') {
+                    return list;
+                }
+                if (c != ',') {
+                    throw new IllegalArgumentException("expected ',' or ']' at " + (pos - 1));
+                }
+            }
+        }
+
+        String readString() {
+            if (done() || s.charAt(pos) != '"') {
+                throw new IllegalArgumentException("expected a string at " + pos);
+            }
+            pos++;
+            StringBuilder sb = new StringBuilder();
+            while (true) {
+                if (done()) {
+                    throw new IllegalArgumentException("unterminated string");
+                }
+                char c = s.charAt(pos++);
+                if (c == '"') {
+                    return sb.toString();
+                }
+                if (c != '\\') {
+                    sb.append(c);
+                    continue;
+                }
+                char e = s.charAt(pos++);
+                switch (e) {
+                    case 'n': sb.append('\n'); break;
+                    case 't': sb.append('\t'); break;
+                    case 'r': sb.append('\r'); break;
+                    case 'b': sb.append('\b'); break;
+                    case 'f': sb.append('\f'); break;
+                    case 'u':
+                        sb.append((char) Integer.parseInt(s.substring(pos, pos + 4), 16));
+                        pos += 4;
+                        break;
+                    default: sb.append(e);
+                }
+            }
+        }
+
+        Double readNumber() {
+            int start = pos;
+            while (pos < s.length() && "+-.eE0123456789".indexOf(s.charAt(pos)) >= 0) {
+                pos++;
+            }
+            try {
+                return Double.valueOf(s.substring(start, pos));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("bad number at " + start);
+            }
+        }
+
+        void expect(String word) {
+            if (!s.startsWith(word, pos)) {
+                throw new IllegalArgumentException("expected " + word + " at " + pos);
+            }
+            pos += word.length();
+        }
+    }
+
+    // ---------- writing ----------
+
     /** Registers an encoder for a type whose state is not in public fields. */
     public static <T> void register(Class<T> type, Encoder<T> encoder) {
         ENCODERS.put(type, encoder);

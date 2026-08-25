@@ -1,80 +1,120 @@
 package com.antu.core.node;
 
-import com.antu.core.bus.Bus;
+import com.antu.core.graph.In;
+import com.antu.core.graph.Out;
+import com.antu.core.graph.Port;
+import com.antu.core.time.Clock;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 /**
  * One unit of behaviour: a driver, a filter, a planner.
  *
- * <p>Nodes talk only through the {@link Bus}. A node holding a reference to
- * another node is the thing this design exists to prevent — it is how a robot
- * stack turns into a knot that cannot be tested a piece at a time.
+ * <p>A node declares what it consumes and produces as public final port fields,
+ * and reads and writes only through them. It never learns the name of another
+ * node, and there is nothing to look up at runtime — the wiring is decided when
+ * the graph is built, and a mismatch is a compile error.
  *
- * <p>Lifecycle is {@link #start} then repeated {@link #tick} then {@link #stop}.
- * Subscriptions belong in {@code start}, because a node may be started and
- * stopped more than once across a session.
+ * <pre>
+ *   public final class Odometer extends Node {
+ *       public final In&lt;ImuSample&gt; imu = in("imu", ImuSample.class);
+ *       public final Out&lt;Pose2&gt; pose = out("pose", Pose2.class);
+ *
+ *       public Odometer() { super("odometer"); }
+ *
+ *       &#64;Override public void tick(Context ctx) {
+ *           pose.publish(integrate(imu.get()));
+ *       }
+ *   }
+ * </pre>
+ *
+ * <p>{@link #tick} must not block. A node that has to wait on hardware owns a
+ * thread and publishes from it; the scheduler's loop is shared by every node in
+ * the graph, and one blocking read stops all of them.
  */
-public interface Node {
+public abstract class Node {
 
-    /** Identifier, unique within a graph. Appears in logs and the topic list. */
-    String name();
+    private final String name;
+    private final List<Port<?>> ports = new ArrayList<>();
+
+    protected Node(String name) {
+        if (name == null || name.isEmpty()) {
+            throw new IllegalArgumentException("node name is empty");
+        }
+        this.name = name;
+    }
+
+    /** Identifier, unique within a graph. Appears in channel names and logs. */
+    public final String name() {
+        return name;
+    }
+
+    /** Every port this node declared, for wiring and introspection. */
+    public final List<Port<?>> ports() {
+        return Collections.unmodifiableList(ports);
+    }
+
+    /** Declares an output. Call only in a field initialiser or constructor. */
+    protected final <T> Out<T> out(String portName, Class<T> type) {
+        Out<T> port = Port.newOut(portName, type);
+        register(port);
+        return port;
+    }
+
+    /** Declares an input with no value until something arrives. */
+    protected final <T> In<T> in(String portName, Class<T> type) {
+        return in(portName, type, null);
+    }
 
     /**
-     * Claims resources and subscribes. Publishing here is allowed but rarely
-     * wanted, since subscribers may not exist yet.
+     * Declares an input with a fallback returned by {@code get()} before the first
+     * message. A velocity input defaulting to zero is safer than one defaulting to
+     * null, because the node cannot forget to check.
      */
-    void start(Context context) throws Exception;
+    protected final <T> In<T> in(String portName, Class<T> type, T fallback) {
+        In<T> port = Port.newIn(portName, type, fallback);
+        register(port);
+        return port;
+    }
+
+    private void register(Port<?> port) {
+        for (Port<?> existing : ports) {
+            if (existing.name.equals(port.name)) {
+                throw new IllegalArgumentException(
+                        name + " declares two ports named '" + port.name + "'");
+            }
+        }
+        port.setOwner(name);
+        ports.add(port);
+    }
+
+    /** Claims resources. Ports are already wired by the time this runs. */
+    public void start(Context context) throws Exception {
+    }
 
     /**
-     * One step of work, called at the node's declared rate.
+     * One step of work, at the node's declared rate.
      *
-     * <p>Queued subscriptions are drained immediately before this, so anything
-     * that arrived since the last tick has already reached its listener.
-     *
-     * <p>Must not block. A node that needs to wait on hardware owns a thread and
-     * hands results to its tick through a queue — see the driver modules.
+     * <p>Everything published to this node's inputs since the previous tick is
+     * already waiting when this is called.
      */
-    void tick(Context context) throws Exception;
+    public abstract void tick(Context context) throws Exception;
 
-    /** Releases everything {@link #start} claimed. Must tolerate being called twice. */
-    void stop();
+    /** Releases what {@link #start} claimed. Must tolerate being called twice. */
+    public void stop() {
+    }
 
-    /** What a node is given: the bus, the clock, and its own identity. */
-    interface Context {
+    @Override public String toString() {
+        return getClass().getSimpleName() + "(" + name + ")";
+    }
 
-        /** The bus, for publishing and for latest-value reads. */
-        Bus bus();
-
-        com.antu.core.time.Clock clock();
-
+    /** What a node is given while running. */
+    public interface Context {
+        Clock clock();
         String nodeName();
-
         /** Ticks completed since start, useful for rate-dividing inside a node. */
         long tickCount();
-
-        /**
-         * Subscribes with queued delivery, drained immediately before this node's
-         * tick and closed when it stops.
-         *
-         * <p>Always prefer this to {@code bus().subscribe(...)}: a subscription
-         * the scheduler does not know about is never drained, which presents as a
-         * topic that publishes fine and is silently never received.
-         */
-        <T> com.antu.core.bus.Subscription subscribe(
-                com.antu.core.bus.Topic<T> topic, com.antu.core.bus.Listener<T> listener);
-
-        /**
-         * Subscribes with an explicit delivery mode. {@code DIRECT} listeners fire
-         * on the publisher's thread rather than on this node's tick.
-         */
-        <T> com.antu.core.bus.Subscription subscribe(
-                com.antu.core.bus.Topic<T> topic, com.antu.core.bus.Listener<T> listener,
-                Bus.Delivery delivery);
-
-        /** Publishes with the graph clock's current time. */
-        <T> void publish(com.antu.core.bus.Topic<T> topic, T payload);
-
-        /** Publishes with an explicit stamp, as drivers should. */
-        <T> void publish(com.antu.core.bus.Topic<T> topic, T payload,
-                         com.antu.core.time.Stamp stamp);
     }
 }

@@ -1,6 +1,5 @@
 package com.antu.drivers.base;
 
-import com.antu.core.Topics;
 import com.antu.core.geometry.Angles;
 import com.antu.core.geometry.Pose2;
 import com.antu.core.geometry.Twist2;
@@ -9,8 +8,9 @@ import com.antu.core.msg.BaseStatus;
 import com.antu.core.msg.ImuSample;
 import com.antu.core.msg.Odometry;
 import com.antu.core.msg.RangeScan;
+import com.antu.core.graph.In;
+import com.antu.core.graph.Out;
 import com.antu.core.log.Log;
-import com.antu.core.node.AbstractNode;
 import com.antu.core.node.Node;
 import com.antu.core.time.Stamp;
 
@@ -22,7 +22,6 @@ import com.arcos.Transport;
 import com.arcos.transport.UsbPermission;
 import com.arcos.transport.UsbSerialTransport;
 
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The Pioneer drive base, as a node.
@@ -53,7 +52,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * that died, or a teleop client that dropped off the network. After
  * {@link #setCommandTimeout} the base is commanded to stop.
  */
-public final class ArcosBaseDriver extends AbstractNode {
+public final class ArcosBaseDriver extends Node {
 
     private static final String TAG = "base";
 
@@ -93,14 +92,26 @@ public final class ArcosBaseDriver extends AbstractNode {
      * import, so a bare {@code Context} here means the wrong one.
      */
     private final android.content.Context context;
+
+    // ---------- ports ----------
+
+    /** Velocity to hold, in the robot frame. Defaults to stopped. */
+    public final In<Twist2> cmdVel = in("cmd_vel", Twist2.class, Twist2.ZERO);
+    /** Wheel odometry: continuous and smooth, but drifts. */
+    public final Out<Odometry> odom = out("odom", Odometry.class);
+    /** Battery, motor and e-stop state. */
+    public final Out<BaseStatus> status = out("status", BaseStatus.class);
+    /** The gyro inside the drive base, distinct from the phone's. */
+    public final Out<ImuSample> imu = out("imu", ImuSample.class);
+    /** The sonar ring. */
+    public final Out<RangeScan> ranges = out("ranges", RangeScan.class);
     private final Transport transport;
     private final double wheelbase;
 
-    /** Latest command, written by the bus thread and read by the tick. */
-    private final AtomicReference<Twist2> command = new AtomicReference<>(Twist2.ZERO);
-
     private ArcosRobot robot;
     private volatile Node.Context ctx;
+    /** Last non-zero command, so a silent input can be distinguished from a stop. */
+    private Twist2 lastCommand = Twist2.ZERO;
     /** When the next connection attempt is allowed. */
     private long nextAttemptNanos;
     /** A permission dialog is open; do not raise another. */
@@ -159,12 +170,6 @@ public final class ArcosBaseDriver extends AbstractNode {
         this.lastCommandNanos = context.clock().now().nanos();
         this.stoppedForSilence = false;
 
-        context.subscribe(Topics.CMD_VEL, m -> {
-            command.set(m.payload());
-            lastCommandNanos = ctx.clock().now().nanos();
-            stoppedForSilence = false;
-        });
-
         robot = new ArcosRobot(transport);
         // The library's own watchdog would fight this node's, and this node is the
         // one that knows whether /cmd_vel is still flowing.
@@ -187,17 +192,27 @@ public final class ArcosBaseDriver extends AbstractNode {
         }
         connecting = false;
 
-        Twist2 wanted = command.get();
+        // Freshness, not just value: a command input that has gone quiet is not
+        // the same as one commanding zero, and only the first is a fault.
+        if (cmdVel.isFresh()) {
+            lastCommand = cmdVel.get();
+            lastCommandNanos = context.clock().now().nanos();
+            stoppedForSilence = false;
+        }
+        Twist2 wanted = lastCommand;
 
-        // A silent /cmd_vel means whoever was steering has gone. Stop, and keep
-        // stopping, until someone starts publishing again.
+        // Whoever was steering has gone. Stop, and keep stopping, until something
+        // starts publishing again. The library's own watchdog cannot see this,
+        // because this node keeps pulsing regardless.
         if (commandTimeoutNanos > 0 && !wanted.isZero()) {
             long silentFor = context.clock().now().nanos() - lastCommandNanos;
             if (silentFor > commandTimeoutNanos) {
                 if (!stoppedForSilence) {
                     stoppedForSilence = true;
-                    command.set(Twist2.ZERO);
+                    Log.w(TAG, "no command for " + (commandTimeoutNanos / 1_000_000)
+                            + " ms; stopping", null);
                 }
+                lastCommand = Twist2.ZERO;
                 wanted = Twist2.ZERO;
             }
         }
@@ -259,7 +274,7 @@ public final class ArcosBaseDriver extends AbstractNode {
                 });
     }
 
-    @Override protected void onStop() {
+    @Override public void stop() {
         ArcosRobot r = robot;
         robot = null;
         if (r != null) {
@@ -279,7 +294,7 @@ public final class ArcosBaseDriver extends AbstractNode {
 
     /** Emergency stop: ignores the deceleration limit. */
     public void emergencyStop() {
-        command.set(Twist2.ZERO);
+        lastCommand = Twist2.ZERO;
         ArcosRobot r = robot;
         if (r != null) {
             r.eStop();
@@ -317,7 +332,7 @@ public final class ArcosBaseDriver extends AbstractNode {
             connecting = false;
             // Nothing is steering a disconnected base; make sure a stale command
             // cannot be applied the instant it comes back.
-            command.set(Twist2.ZERO);
+            lastCommand = Twist2.ZERO;
         }
 
         @Override public void onError(Throwable error) {
@@ -332,8 +347,7 @@ public final class ArcosBaseDriver extends AbstractNode {
         }
 
         @Override public void onState(RobotState s) {
-            Node.Context c = ctx;
-            if (c == null) {
+            if (ctx == null) {
                 return;
             }
             // The library stamps each state; use it rather than "now", so that
@@ -345,24 +359,24 @@ public final class ArcosBaseDriver extends AbstractNode {
             Twist2 velocity = Twist2.fromWheelSpeeds(
                     s.leftVel / MM_PER_M, s.rightVel / MM_PER_M, wheelbase);
 
-            c.publish(Topics.ODOM, new Odometry(pose, velocity), stamp);
+            odom.publish(new Odometry(pose, velocity), stamp);
             lastPose = pose;
             lastPoseStamp = stamp;
 
-            c.publish(Topics.BASE_STATUS, new BaseStatus(
+            status.publish(new BaseStatus(
                     s.batteryVoltage, s.motorsEnabled, s.eStopPressed, s.stalled(),
                     robotModel()), stamp);
 
             // The base's heading comes from its internal gyro, which is a genuinely
             // separate sensor from the phone's and worth publishing as one.
-            c.publish(Topics.IMU_BASE, new ImuSample(
+            imu.publish(new ImuSample(
                     new Vec3(0, 0, velocity.angular), Vec3.ZERO,
                     Angles.toRadians(s.theta)), stamp);
 
-            publishRanges(c, s, stamp);
+            publishRanges(s, stamp);
         }
 
-        private void publishRanges(Node.Context c, RobotState s, Stamp stamp) {
+        private void publishRanges(RobotState s, Stamp stamp) {
             int n = Math.min(SONAR_BEARINGS_DEG.length, s.sonar.length);
             double[] bearings = new double[n];
             double[] ranges = new double[n];
@@ -379,7 +393,7 @@ public final class ArcosBaseDriver extends AbstractNode {
                 any |= mm >= 0;
             }
             if (any) {
-                c.publish(Topics.RANGES,
+                ArcosBaseDriver.this.ranges.publish(
                         new RangeScan(bearings, ranges, SONAR_MIN_M, SONAR_MAX_M), stamp);
             }
         }

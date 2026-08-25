@@ -43,6 +43,16 @@ public final class HttpServer {
         Response handle(Request request) throws Exception;
     }
 
+    /**
+     * Takes over a connection that asked to be upgraded.
+     *
+     * <p>The server stops managing the socket entirely: closing it is the
+     * handler's job, and it is called on a thread of its own.
+     */
+    public interface UpgradeHandler {
+        void handle(Socket socket, Request request, Map<String, String> headers);
+    }
+
     /** What a handler is given. */
     public static final class Request {
         public final String method;
@@ -131,6 +141,7 @@ public final class HttpServer {
 
     private final int port;
     private final Map<String, Handler> routes = new LinkedHashMap<>();
+    private final Map<String, UpgradeHandler> upgrades = new LinkedHashMap<>();
     private Handler fallback;
 
     private ServerSocket server;
@@ -144,6 +155,18 @@ public final class HttpServer {
     /** Registers a handler for an exact path. */
     public HttpServer route(String path, Handler handler) {
         routes.put(path, handler);
+        return this;
+    }
+
+    /**
+     * Registers a handler for connections that upgrade away from HTTP.
+     *
+     * <p>Runs on a dedicated thread rather than a pool worker. A WebSocket lives
+     * for as long as the client watches, so serving one from the request pool
+     * would retire a worker permanently; four viewers would deadlock the API.
+     */
+    public HttpServer upgrade(String path, UpgradeHandler handler) {
+        upgrades.put(path, handler);
         return this;
     }
 
@@ -213,6 +236,7 @@ public final class HttpServer {
     }
 
     private void serve(Socket socket) {
+        boolean upgraded = false;
         try {
             socket.setSoTimeout(READ_TIMEOUT_MS);
             InputStream in = socket.getInputStream();
@@ -225,16 +249,34 @@ public final class HttpServer {
                 respond(socket, Response.error(400, "malformed request"));
                 return;
             }
-            // Headers are read and discarded: nothing here needs them, but they
-            // must be consumed or the client sees a reset before its body lands.
+            // Headers are kept: an upgrade needs Sec-WebSocket-Key, and they must
+            // be consumed in any case or the client sees a reset.
+            Map<String, String> headers = new HashMap<>();
             while (true) {
                 String header = readLine(in);
                 if (header == null || header.isEmpty()) {
                     break;
                 }
+                int colon = header.indexOf(':');
+                if (colon > 0) {
+                    // Header names are case-insensitive and clients disagree about
+                    // capitalisation, so normalise once here.
+                    headers.put(header.substring(0, colon).trim().toLowerCase(),
+                            header.substring(colon + 1).trim());
+                }
             }
 
             Request request = parse(parts[0], parts[1]);
+
+            UpgradeHandler upgrade = upgrades.get(request.path);
+            if (upgrade != null) {
+                Thread t = new Thread(() -> upgrade.handle(socket, request, headers),
+                        "antu-ws-" + socket.getPort());
+                t.setDaemon(true);
+                t.start();
+                upgraded = true;
+                return;                  // the handler owns the socket now
+            }
             Handler handler = routes.get(request.path);
             if (handler == null) {
                 handler = fallback;
@@ -252,10 +294,12 @@ public final class HttpServer {
             }
             Log.w(TAG, "request failed: " + e);
         } finally {
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-                // Already closed.
+            if (!upgraded) {
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // Already closed.
+                }
             }
         }
     }

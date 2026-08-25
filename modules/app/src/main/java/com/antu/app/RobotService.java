@@ -10,13 +10,13 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 
-import com.antu.core.bus.Bus;
-import com.antu.core.exec.Graph;
+import com.antu.core.graph.Channel;
+import com.antu.core.graph.Graph;
 import com.antu.core.log.Log;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
 import com.antu.drivers.base.ArcosBaseDriver;
-import com.antu.ops.ApiNode;
+import com.antu.ops.OpsNode;
 
 import com.arcos.Transport;
 import com.arcos.transport.SimTransport;
@@ -40,7 +40,7 @@ public final class RobotService extends Service {
     /** The single running graph, so the UI can inspect it without binding. */
     private static volatile Graph graph;
     /** The base driver, for the console's motor and e-stop controls. */
-    private static volatile ArcosBaseDriver base;
+    private static volatile ArcosBaseDriver baseDriver;
     /** Port for the operations API. */
     private static final int API_PORT = 8080;
 
@@ -56,7 +56,7 @@ public final class RobotService extends Service {
 
     /** The base driver, or null before the graph starts. */
     public static ArcosBaseDriver base() {
-        return base;
+        return baseDriver;
     }
 
     @Override public IBinder onBind(Intent intent) {
@@ -73,27 +73,32 @@ public final class RobotService extends Service {
         wakeLock.acquire();
 
         try {
-            Graph g = new Graph(Clock.SYSTEM);
-
-            // The base runs at 10 Hz because that is the rate ARCOS streams status
-            // at; ticking faster would only re-send the same command.
-            ArcosBaseDriver driver = new ArcosBaseDriver(this, chooseTransport());
-            g.add(driver, Rate.hz(10));
-            base = driver;
-
-            // The API runs faster than the base so a held teleop command is
-            // refreshed well within the base driver's silence timeout.
-            ApiNode api = new ApiNode(API_PORT, RobotService::graph, this::readAsset)
+            // The whole robot, declared in one place. Wiring is checked by javac
+            // where types allow and by build() where they do not: a missing
+            // connection, two writers on one input, or a cycle without a delayed
+            // edge all fail here rather than on a moving robot.
+            ArcosBaseDriver base = new ArcosBaseDriver(this, chooseTransport());
+            OpsNode ops = new OpsNode(API_PORT, RobotService::graph, this::readAsset)
                     .withBaseControls(
-                            () -> driver.enableMotors(true),
-                            () -> driver.enableMotors(false),
-                            driver::emergencyStop,
-                            driver::resetOdometry);
-            g.add(api, Rate.hz(20));
+                            () -> base.enableMotors(true),
+                            () -> base.enableMotors(false),
+                            base::emergencyStop,
+                            base::resetOdometry);
 
+            Graph g = Graph.builder(Clock.SYSTEM)
+                    // The base runs at the rate ARCOS streams status; ops runs
+                    // faster so a held teleop command is refreshed well inside the
+                    // driver's silence timeout.
+                    .add(base, Rate.hz(10))
+                    .add(ops, Rate.hz(20))
+                    .connect(ops.cmdVel, base.cmdVel)
+                    .build();
+
+            baseDriver = base;
             g.spin();
             graph = g;
-            android.util.Log.i(TAG, "graph running with " + g.nodes().size() + " node(s)");
+            android.util.Log.i(TAG, "graph running with " + g.nodes().size()
+                    + " nodes, " + g.channels().size() + " channels; ops on " + ops.address());
             startStatsLogging();
         } catch (Exception e) {
             android.util.Log.e(TAG, "graph failed to start", e);
@@ -179,8 +184,8 @@ public final class RobotService extends Service {
                       .append(" missed=").append(n.missed)
                       .append(" errors=").append(n.errors);
                 }
-                for (Bus.TopicInfo t : g.bus().topics()) {
-                    sb.append("\n    ").append(t);
+                for (Channel<?> ch : g.channels().values()) {
+                    sb.append("\n    ").append(ch);
                 }
                 android.util.Log.i(TAG, sb.toString());
                 try {
@@ -204,7 +209,7 @@ public final class RobotService extends Service {
     @Override public void onDestroy() {
         Graph g = graph;
         graph = null;
-        base = null;
+        baseDriver = null;
         if (g != null) {
             g.stop();
         }
