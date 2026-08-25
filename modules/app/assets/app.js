@@ -9,7 +9,7 @@
 
 const WANTED = ['base.odom', 'base.status', 'base.ranges', 'base.imu',
                 'phone_imu.imu', 'camera.frame', 'ar.frame', 'ar.pose',
-                'fusion.pose'];
+                'fusion.pose', 'mapper.map'];
 
 // Full-stick and full-key speeds. A P3-DX will do far more; this is an indoor pace.
 const MAX_SPEED = 0.5;      // m/s
@@ -19,7 +19,8 @@ const SLOW_FACTOR = 0.35;   // held shift
 // stops the robot if this page freezes or the link drops mid-drive.
 const DRIVE_PERIOD_MS = 100;
 const STALE_MS = 2000;
-const RANGE_M = 3.0;
+const RANGE_M = 3.0;      // sonar rings
+let mapRange = 8.0;       // how much of the map to show, metres
 
 const el = (id) => document.getElementById(id);
 const latest = {};
@@ -108,20 +109,31 @@ function render() {
     el('d-th').textContent = fmt(odom.pose.theta * 180 / Math.PI, 1, '°');
     el('d-v').textContent = fmt(odom.velocity.linearX, 3, ' m/s');
     el('d-w').textContent = fmt(odom.velocity.angular, 3, ' rad/s');
-    trail.push({ x: odom.pose.x, y: odom.pose.y });
-    if (trail.length > 400) trail.shift();
+    odomTrail.push({ x: odom.pose.x, y: odom.pose.y });
+    if (odomTrail.length > 400) odomTrail.shift();
   }
 
   const fused = latest['fusion.pose'];
   if (fused) {
-    const near = el('theta');
     el('theta').textContent = fmt(fused.pose.theta * 180 / Math.PI, 0, '°');
+    trail.push({ x: fused.pose.x, y: fused.pose.y });
+    if (trail.length > 400) trail.shift();
+
     const src = el('poseSrc');
-    if (src) {
-      src.textContent = fused.source === 'TRACKED'
-        ? 'tracked'
-        : `dead reckoning ${fused.secondsSinceFix.toFixed(0)}s`;
-      src.className = fused.source === 'TRACKED' ? 'good' : 'warn';
+    src.textContent = fused.source === 'TRACKED'
+      ? 'tracked'
+      : `dead ${fused.secondsSinceFix.toFixed(0)}s`;
+    src.className = fused.source === 'TRACKED' ? 'good' : 'warn';
+
+    el('d-src').textContent = fused.source;
+    el('d-fix').textContent = fmt(fused.secondsSinceFix, 1, ' s');
+    el('d-corr').textContent = fmt(fused.lastCorrection, 3, ' m');
+    // How far the wheels have wandered from the anchored estimate. This number
+    // is the whole argument for having a visual tracker at all.
+    if (odom) {
+      const dx = fused.pose.x - odom.pose.x;
+      const dy = fused.pose.y - odom.pose.y;
+      el('d-drift').textContent = fmt(Math.hypot(dx, dy), 3, ' m');
     }
   }
 
@@ -168,7 +180,59 @@ function renderChannels(channels) {
 
 // ── sonar minimap ──────────────────────────────────────────────────────────
 
-const trail = [];
+// Two trails, deliberately. The wheels drift and the visual tracker does not, so
+// drawing both makes the difference between them visible instead of theoretical:
+// drive a loop and the odometry trail walks away from the fused one.
+const trail = [];        // fused: anchored to the room
+const odomTrail = [];    // wheels: continuous, drifting
+
+/**
+ * The occupied cells, seen from above with the robot always pointing up.
+ *
+ * Cells arrive as world coordinates in metres, so nothing here needs to know how
+ * the grid is laid out on the robot. They are drawn relative to the robot's
+ * current pose, which is what makes the view egocentric without the map itself
+ * being egocentric — the map is anchored to the room and this is a window onto it.
+ */
+function drawMap(ctx, cx, cy, scale) {
+  const m = latest['mapper.map'];
+  const fused = latest['fusion.pose'];
+  if (!m || !fused || !m.cells || !m.cells.length) return;
+
+  const c = Math.cos(-fused.pose.theta + Math.PI / 2);
+  const s = Math.sin(-fused.pose.theta + Math.PI / 2);
+  const cell = Math.max(1.5, m.resolution * scale);
+
+  ctx.fillStyle = 'rgba(120,200,255,.75)';
+  for (const [wx, wy] of m.cells) {
+    const dx = wx - fused.pose.x;
+    const dy = wy - fused.pose.y;
+    if (Math.abs(dx) > mapRange || Math.abs(dy) > mapRange) continue;
+    const px = cx + (dx * c - dy * s) * scale;
+    const py = cy - (dx * s + dy * c) * scale;
+    ctx.fillRect(px - cell / 2, py - cell / 2, cell, cell);
+  }
+
+  el('d-mapcells').textContent = `${m.occupied} / ${m.observed}`;
+}
+
+function drawTrail(ctx, cx, cy, scale, points, here, colour, width) {
+  // Rotate into a robot-up view, so the trail shows where the robot came from
+  // regardless of which way it is now facing.
+  const c = Math.cos(-here.theta + Math.PI / 2);
+  const s = Math.sin(-here.theta + Math.PI / 2);
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const dx = p.x - here.x;
+    const dy = p.y - here.y;
+    const px = cx + (dx * c - dy * s) * scale;
+    const py = cy - (dx * s + dy * c) * scale;
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  });
+  ctx.stroke();
+}
 
 function fit(canvas) {
   const ratio = window.devicePixelRatio || 1;
@@ -187,10 +251,16 @@ function drawRadar() {
   const { ctx, w, h } = fit(el('radar'));
   const cx = w / 2;
   const cy = h / 2;
+  const mapScale = (Math.min(cx, cy) - 6) / mapRange;
   const scale = (Math.min(cx, cy) - 6) / RANGE_M;
 
   ctx.clearRect(0, 0, w, h);
-  ctx.strokeStyle = 'rgba(120,140,170,.2)';
+
+  // The map first, underneath everything: it is the thing the panel is for now,
+  // and the sonar rings and trails are annotations on top of it.
+  drawMap(ctx, cx, cy, mapScale);
+
+  ctx.strokeStyle = 'rgba(120,140,170,.14)';
   ctx.lineWidth = 1;
   for (let r = 1; r <= 3; r++) {
     ctx.beginPath();
@@ -198,22 +268,16 @@ function drawRadar() {
     ctx.stroke();
   }
 
+  // Both trails are drawn relative to the robot's current position in their own
+  // frame, so each shows where that estimator thinks it has been.
+  const fused = latest['fusion.pose'];
   const odom = latest['base.odom'];
-  if (odom && trail.length > 1) {
-    // The trail is in the odometry frame; rotate so the robot always points up.
-    const c = Math.cos(-odom.pose.theta + Math.PI / 2);
-    const s = Math.sin(-odom.pose.theta + Math.PI / 2);
-    ctx.strokeStyle = 'rgba(77,163,255,.5)';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    trail.forEach((p, i) => {
-      const dx = p.x - odom.pose.x;
-      const dy = p.y - odom.pose.y;
-      const px = cx + (dx * c - dy * s) * scale;
-      const py = cy - (dx * s + dy * c) * scale;
-      i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
-    });
-    ctx.stroke();
+  if (fused && trail.length > 1) {
+    drawTrail(ctx, cx, cy, mapScale, trail, fused.pose, 'rgba(77,163,255,.85)', 2);
+  }
+  if (odom && odomTrail.length > 1) {
+    // Dimmer: this is the one that drifts, shown for comparison rather than use.
+    drawTrail(ctx, cx, cy, mapScale, odomTrail, odom.pose, 'rgba(255,159,67,.45)', 1.2);
   }
 
   const ranges = latest['base.ranges'];

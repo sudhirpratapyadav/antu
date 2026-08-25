@@ -16,6 +16,7 @@ import com.antu.core.log.Log;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
 import com.antu.brain.CommandArbiter;
+import com.antu.brain.OccupancyMapper;
 import com.antu.brain.PoseFusion;
 import com.antu.drivers.base.ArcosBaseDriver;
 import com.antu.drivers.ar.ArTrackerDriver;
@@ -84,6 +85,36 @@ public final class RobotService extends Service {
         return cameraDriver;
     }
 
+    /** Driver state the graph itself cannot report. */
+    private static String diagnostics() {
+        StringBuilder sb = new StringBuilder("{");
+        ArTrackerDriver t = arTracker;
+        sb.append("\"arcore\":");
+        if (t == null) {
+            sb.append("null");
+        } else {
+            sb.append("{\"running\":").append(t.isRunning())
+              .append(",\"depthSupported\":").append(t.isDepthSupported())
+              .append(",\"framesEncoded\":").append(t.encodedFrames())
+              .append(",\"framesDropped\":").append(t.droppedFrames())
+              .append(",\"failure\":")
+              .append(t.failure() == null ? "null" : "\"" + t.failure() + "\"")
+              .append('}');
+        }
+        CameraDriver c = cameraDriver;
+        sb.append(",\"camera\":");
+        if (c == null) {
+            sb.append("null");
+        } else {
+            sb.append("{\"captured\":").append(c.captured())
+              .append(",\"dropped\":").append(c.dropped())
+              .append(",\"failure\":")
+              .append(c.failure() == null ? "null" : "\"" + c.failure() + "\"")
+              .append('}');
+        }
+        return sb.append('}').toString();
+    }
+
     /** The AR tracker, or null when plain video capture is running instead. */
     public static ArTrackerDriver tracker() {
         return arTracker;
@@ -109,6 +140,7 @@ public final class RobotService extends Service {
             // edge all fail here rather than on a moving robot.
             ArcosBaseDriver base = new ArcosBaseDriver(this, chooseTransport());
             OpsNode ops = new OpsNode(API_PORT, RobotService::graph, this::readAsset)
+                    .withDiagnostics(RobotService::diagnostics)
                     .withBaseControls(
                             () -> base.enableMotors(true),
                             () -> base.enableMotors(false),
@@ -155,14 +187,23 @@ public final class RobotService extends Service {
             // Fusion only makes sense with a tracker to anchor to; without one
             // the wheels are the whole story and base.odom already says so.
             PoseFusion fusion = tracker == null ? null : new PoseFusion();
+            // The phone sits about 30 cm above the floor on this robot, which is
+            // what places the obstacle band; see setCameraHeight.
+            OccupancyMapper mapper = tracker == null ? null
+                    : new OccupancyMapper().setCameraHeight(0.30);
 
             if (tracker != null) {
                 // 10 Hz: ARCore runs at camera rate on its own thread, and the
                 // newest estimate is the only one worth republishing.
                 builder.add(tracker, Rate.hz(10))
                        .add(fusion, Rate.hz(10))
+                       // 2 Hz: the map changes slowly, and every publish copies
+                       // the whole grid.
+                       .add(mapper, Rate.hz(2))
                        .connect(tracker.pose, fusion.tracked)
-                       .connect(base.odom, fusion.odom);
+                       .connect(base.odom, fusion.odom)
+                       .connect(tracker.points, mapper.points)
+                       .connect(fusion.pose, mapper.pose);
             } else {
                 builder.add(camera, Rate.hz(15));
             }

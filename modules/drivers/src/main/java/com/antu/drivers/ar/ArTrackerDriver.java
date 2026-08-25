@@ -11,6 +11,7 @@ import android.opengl.GLES20;
 import com.antu.core.geometry.Pose3;
 import com.antu.core.graph.Out;
 import com.antu.core.log.Log;
+import com.antu.core.msg.PointCloud;
 import com.antu.core.msg.PosedFrame;
 import com.antu.core.msg.TrackedPose;
 import com.antu.core.msg.VideoFrame;
@@ -94,6 +95,16 @@ public final class ArTrackerDriver extends Node {
      */
     public final Out<PosedFrame> frame = out("frame", PosedFrame.class);
 
+    /**
+     * Feature points the tracker is using, in its world frame.
+     *
+     * <p>These come free: the tracker computes them to know where it is, so
+     * reading them costs almost nothing. They are sparse and noisy compared with
+     * a depth model's output, but they are real geometry in real metres, and they
+     * are enough to build a map from before any inference is running.
+     */
+    public final Out<PointCloud> points = out("points", PointCloud.class);
+
     private final android.content.Context context;
 
     private Thread thread;
@@ -104,8 +115,11 @@ public final class ArTrackerDriver extends Node {
             new AtomicReference<>(new TrackedPose(Pose3.IDENTITY, TrackedPose.State.STOPPED, "", 0));
     /** Newest encoded frame, handed to the tick to publish. */
     private final AtomicReference<PosedFrame> pendingFrame = new AtomicReference<>();
+    private final AtomicReference<PointCloud> pendingPoints =
+            new AtomicReference<>(PointCloud.empty());
     private volatile long encoded;
     private volatile long droppedFrames;
+    private volatile boolean depthSupported;
 
     public ArTrackerDriver(android.content.Context context) {
         super("ar");
@@ -131,6 +145,11 @@ public final class ArTrackerDriver extends Node {
         return droppedFrames;
     }
 
+    /** Whether this device can produce a dense depth image. */
+    public boolean isDepthSupported() {
+        return depthSupported;
+    }
+
     @Override public void start(Node.Context ctx) {
         running = true;
         failure = null;
@@ -147,6 +166,10 @@ public final class ArTrackerDriver extends Node {
         PosedFrame f = pendingFrame.getAndSet(null);
         if (f != null) {
             frame.publish(f);
+        }
+        PointCloud c = pendingPoints.get();
+        if (c.size > 0) {
+            points.publish(c);
         }
     }
 
@@ -212,6 +235,36 @@ public final class ArTrackerDriver extends Node {
         }
     }
 
+    /**
+     * Copies the tracker's feature points out of its buffer.
+     *
+     * <p>The buffer belongs to ARCore and is reused, so the contents must be
+     * copied before the cloud is closed — handing the buffer itself upstream
+     * would give every reader a view that changes under them each frame.
+     */
+    private void readPoints(Frame source) {
+        try (com.google.ar.core.PointCloud cloud = source.acquirePointCloud()) {
+            java.nio.FloatBuffer buffer = cloud.getPoints();
+            // ARCore packs x, y, z, confidence per point.
+            int count = buffer.remaining() / 4;
+            if (count == 0) {
+                return;
+            }
+            float[] xyz = new float[count * 3];
+            float[] conf = new float[count];
+            int base = buffer.position();
+            for (int i = 0; i < count; i++) {
+                xyz[i * 3]     = buffer.get(base + i * 4);
+                xyz[i * 3 + 1] = buffer.get(base + i * 4 + 1);
+                xyz[i * 3 + 2] = buffer.get(base + i * 4 + 2);
+                conf[i]        = buffer.get(base + i * 4 + 3);
+            }
+            pendingPoints.set(new PointCloud(xyz, conf, count));
+        } catch (Throwable t) {
+            Log.d(TAG, "point cloud unavailable: " + t);
+        }
+    }
+
     // ---------- the tracking thread ----------
 
     private void loop() {
@@ -270,6 +323,20 @@ public final class ArTrackerDriver extends Node {
             // Plane finding costs CPU that the control loop and, later, the depth
             // model need more than this does.
             config.setPlaneFindingMode(Config.PlaneFindingMode.DISABLED);
+
+            // The sparse feature cloud is for tracking, not mapping: measured on
+            // this robot it yields two or three points against a plain surface,
+            // which is enough to localise and nowhere near enough to map. The
+            // depth API gives a dense image instead, computed from motion stereo
+            // on devices without a depth sensor.
+            depthSupported = session.isDepthModeSupported(Config.DepthMode.AUTOMATIC);
+            if (depthSupported) {
+                config.setDepthMode(Config.DepthMode.AUTOMATIC);
+                Log.i(TAG, "depth supported; enabling");
+            } else {
+                Log.w(TAG, "this device has no ARCore depth; mapping will need "
+                        + "the monocular model instead", null);
+            }
             session.configure(config);
 
             session.setCameraTextureName(texture[0]);
@@ -294,6 +361,7 @@ public final class ArTrackerDriver extends Node {
                 if (tracking == TrackingState.TRACKING) {
                     Pose p = camera.getPose();
                     maybeEncode(frameObject, camera, p);
+                    readPoints(frameObject);
                     // Full six degrees of freedom. Keeping only translation, as
                     // the original did, discards exactly what is needed to compare
                     // this against the robot's own heading.

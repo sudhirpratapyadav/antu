@@ -71,6 +71,15 @@ public final class OpsNode extends Node {
     private volatile Runnable onMotorsOff;
     private volatile Runnable onEmergencyStop;
     private volatile Runnable onResetOdometry;
+    /**
+     * Driver-specific state the graph cannot know about — whether a camera
+     * opened, whether depth is supported, why a transport will not connect.
+     *
+     * <p>Added because chasing these through logcat kept failing: the camera
+     * subsystem floods the buffer and rotates the interesting line out within
+     * seconds.
+     */
+    private volatile Supplier<String> diagnostics;
 
     /** Supplies the web UI's files, so the same code serves an APK or a directory. */
     public interface AssetSource {
@@ -97,6 +106,12 @@ public final class OpsNode extends Node {
         this.onMotorsOff = motorsOff;
         this.onEmergencyStop = emergencyStop;
         this.onResetOdometry = resetOdometry;
+        return this;
+    }
+
+    /** Supplies a JSON object of driver state, served at /api/diag. */
+    public OpsNode withDiagnostics(Supplier<String> supplier) {
+        this.diagnostics = supplier;
         return this;
     }
 
@@ -230,6 +245,10 @@ public final class OpsNode extends Node {
             return HttpServer.Response.text("odometry reset\n");
         });
         server.route("/video.mjpeg", r -> mjpeg(r.text("channel", videoChannel)));
+        server.route("/api/diag", r -> {
+            Supplier<String> d = diagnostics;
+            return HttpServer.Response.json(d == null ? "{}" : d.get());
+        });
         server.upgrade("/ws", this::onUpgrade);
         server.fallback(this::asset);
         server.start();
