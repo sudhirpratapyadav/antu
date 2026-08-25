@@ -18,6 +18,7 @@ import com.antu.core.log.Log;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
 import com.antu.brain.CommandArbiter;
+import com.antu.brain.CloudMap;
 import com.antu.brain.OccupancyMapper;
 import com.antu.brain.PoseFusion;
 import com.antu.drivers.base.ArcosBaseDriver;
@@ -215,6 +216,10 @@ public final class RobotService extends Service {
             // The only sensor that can see an obstacle on this robot: the sonar
             // ring is deaf and the phone has no depth camera. Absent the model
             // file the node reports itself unavailable and the rest still drives.
+            // The same points, kept in three dimensions. The occupancy grid is
+            // for planning; this is the model of the space.
+            CloudMap cloud = tracker == null ? null : new CloudMap();
+
             DepthMapper depth = tracker == null ? null
                     // Two of eight cores, measured. jarvis found eight fastest
                     // running alone; here four gave 6.7 s inference and 56 loop
@@ -238,8 +243,11 @@ public final class RobotService extends Service {
                        // cores with ARCore, which matters more.
                        .add(depth, Rate.hz(1))
                        .connect(tracker.frame, depth.frame)
+                       .add(cloud, Rate.hz(1))
                        .connect(depth.points, mapper.points)
-                       .connect(fusion.pose, mapper.pose);
+                       .connect(fusion.pose, mapper.pose)
+                       .connect(depth.points, cloud.points)
+                       .connect(fusion.pose, cloud.pose);
             } else {
                 builder.add(camera, Rate.hz(15));
             }

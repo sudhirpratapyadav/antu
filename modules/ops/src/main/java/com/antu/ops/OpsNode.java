@@ -7,6 +7,7 @@ import com.antu.core.graph.Graph;
 import com.antu.core.graph.Message;
 import com.antu.core.graph.Out;
 import com.antu.core.log.Log;
+import com.antu.core.msg.PointCloud;
 import com.antu.core.msg.PosedFrame;
 import com.antu.core.msg.VideoFrame;
 import com.antu.core.node.Node;
@@ -113,6 +114,51 @@ public final class OpsNode extends Node {
     public OpsNode withDiagnostics(Supplier<String> supplier) {
         this.diagnostics = supplier;
         return this;
+    }
+
+    /**
+     * The accumulated cloud as a PLY file.
+     *
+     * <p>A download rather than a viewer. PLY opens in MeshLab, CloudCompare and
+     * Blender, all of which inspect a point cloud far better than anything that
+     * could reasonably be written here — and being able to open the map in a real
+     * tool is what turns "the robot produced something" into "the robot produced
+     * something correct".
+     */
+    private HttpServer.Response ply(String name) {
+        Graph g = graphSupplier.get();
+        if (g == null) {
+            return HttpServer.Response.error(503, "graph not running");
+        }
+        Channel<?> ch = g.channel(name);
+        if (ch == null || !PointCloud.class.isAssignableFrom(ch.type())) {
+            return HttpServer.Response.notFound("no point cloud at " + name);
+        }
+        Message<?> latest = ch.latest();
+        if (latest == null) {
+            return HttpServer.Response.error(503, "nothing accumulated yet");
+        }
+        PointCloud c = (PointCloud) latest.payload();
+
+        StringBuilder sb = new StringBuilder(c.size * 40 + 256);
+        sb.append("ply\nformat ascii 1.0\n")
+          .append("comment produced by antu: Depth-Anything metric + ARCore pose\n")
+          .append("element vertex ").append(c.size).append('\n')
+          .append("property float x\nproperty float y\nproperty float z\n")
+          .append("property float confidence\n")
+          .append("end_header\n");
+        for (int i = 0; i < c.size; i++) {
+            sb.append((float) c.x(i)).append(' ')
+              .append((float) c.y(i)).append(' ')
+              .append((float) c.z(i)).append(' ')
+              .append((float) c.confidence(i)).append('\n');
+        }
+        try {
+            return HttpServer.Response.bytes("application/octet-stream",
+                    sb.toString().getBytes("UTF-8"));
+        } catch (java.io.UnsupportedEncodingException e) {
+            throw new IllegalStateException("UTF-8 is always supported", e);
+        }
     }
 
     /** Names the channel served at /video.mjpeg. */
@@ -245,6 +291,7 @@ public final class OpsNode extends Node {
             return HttpServer.Response.text("odometry reset\n");
         });
         server.route("/video.mjpeg", r -> mjpeg(r.text("channel", videoChannel)));
+        server.route("/cloud.ply", r -> ply(r.text("channel", "cloud.cloud")));
         server.route("/api/diag", r -> {
             Supplier<String> d = diagnostics;
             return HttpServer.Response.json(d == null ? "{}" : d.get());
