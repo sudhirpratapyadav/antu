@@ -16,6 +16,7 @@ import com.antu.core.log.Log;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
 import com.antu.drivers.base.ArcosBaseDriver;
+import com.antu.drivers.imu.PhoneImuDriver;
 import com.antu.ops.OpsNode;
 
 import com.arcos.Transport;
@@ -85,11 +86,17 @@ public final class RobotService extends Service {
                             base::emergencyStop,
                             base::resetOdometry);
 
+            // The phone's IMU is the better sensor and reports far faster than the
+            // base's, but it measures the phone. Published separately so fusing
+            // the two is a deliberate step, not an accident of naming.
+            PhoneImuDriver phoneImu = new PhoneImuDriver(this);
+
             Graph g = Graph.builder(Clock.SYSTEM)
                     // The base runs at the rate ARCOS streams status; ops runs
                     // faster so a held teleop command is refreshed well inside the
                     // driver's silence timeout.
                     .add(base, Rate.hz(10))
+                    .add(phoneImu, Rate.hz(50))
                     .add(ops, Rate.hz(20))
                     .connect(ops.cmdVel, base.cmdVel)
                     .build();

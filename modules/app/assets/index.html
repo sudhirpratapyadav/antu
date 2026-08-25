@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>antu</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #151b23; --line: #263041;
+    --text: #e6edf3; --dim: #8b949e; --accent: #4da3ff;
+    --warn: #ff9f43; --bad: #f0616d; --good: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    -webkit-user-select: none; user-select: none;
+    overscroll-behavior: none;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .5px; }
+  #link { margin-left: auto; color: var(--dim); font-size: 11px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+  .dot.on { background: var(--good); }
+  main {
+    display: grid; gap: 10px; padding: 10px;
+    grid-template-columns: 1fr;
+  }
+  @media (min-width: 720px) { main { grid-template-columns: 320px 1fr; } }
+  section {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px;
+  }
+  h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--dim); margin: 0 0 8px; font-weight: 600;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 2px 0; vertical-align: top; }
+  td:first-child { color: var(--dim); width: 42%; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  canvas { width: 100%; display: block; border-radius: 6px; touch-action: none; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    flex: 1; min-width: 88px; padding: 9px 10px; border-radius: 6px;
+    border: 1px solid var(--line); background: #1c2530; color: var(--text);
+    font: inherit; cursor: pointer;
+  }
+  button:active { background: #243040; }
+  button.danger { background: #6e2530; border-color: #8b2c3a; }
+  button.on { background: #16432c; border-color: #2c6b46; }
+  #channels { font-size: 11px; }
+  #channels td:first-child { width: 46%; color: var(--accent); }
+  .stale { color: var(--warn); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="dot" id="dot"></div>
+  <h1>antu</h1>
+  <span id="link"></span>
+</header>
+
+<main>
+  <div style="display:flex;flex-direction:column;gap:10px">
+    <section>
+      <h2>base</h2>
+      <table id="state">
+        <tr><td>model</td><td class="num" id="model">–</td></tr>
+        <tr><td>battery</td><td class="num" id="battery">–</td></tr>
+        <tr><td>motors</td><td class="num" id="motors">–</td></tr>
+        <tr><td>e-stop</td><td class="num" id="estop">–</td></tr>
+        <tr><td>x</td><td class="num" id="x">–</td></tr>
+        <tr><td>y</td><td class="num" id="y">–</td></tr>
+        <tr><td>heading</td><td class="num" id="theta">–</td></tr>
+        <tr><td>speed</td><td class="num" id="speed">–</td></tr>
+        <tr><td>turn</td><td class="num" id="turn">–</td></tr>
+        <tr><td>nearest</td><td class="num" id="nearest">–</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>channels</h2>
+      <table id="channels"></table>
+    </section>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:10px">
+    <section>
+      <h2>sonar &amp; track</h2>
+      <canvas id="radar" height="360"></canvas>
+    </section>
+
+    <section>
+      <h2>drive</h2>
+      <canvas id="stick" height="200"></canvas>
+      <div class="row" style="margin-top:10px">
+        <button id="motorsBtn">motors</button>
+        <button id="resetBtn">reset odom</button>
+        <button id="estopBtn" class="danger">E-STOP</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
