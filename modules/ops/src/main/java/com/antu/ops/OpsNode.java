@@ -519,14 +519,21 @@ public final class OpsNode extends Node {
         <T> void subscribe(Channel<T> channel, double maxHz) {
             unsubscribe(channel.name());
             long minGapNanos = maxHz <= 0 ? 0 : (long) (1e9 / maxHz);
-            long[] lastSentNanos = {Long.MIN_VALUE};
+            // A separate flag rather than a sentinel timestamp. Seeding this with
+            // Long.MIN_VALUE and subtracting overflows for any real wall-clock
+            // stamp — 1.79e18 minus -9.22e18 does not fit in a long — so the
+            // difference came out negative and every message was silently dropped
+            // forever. Invisible under a ManualClock, which starts at zero.
+            boolean[] sentAny = {false};
+            long[] lastSentNanos = {0};
 
             Channel.Listener<T> listener = m -> {
                 long stamp = m.stamp().nanos();
                 synchronized (lastSentNanos) {
-                    if (stamp - lastSentNanos[0] < minGapNanos) {
+                    if (sentAny[0] && stamp - lastSentNanos[0] < minGapNanos) {
                         return;                  // dropped by the rate limit
                     }
+                    sentAny[0] = true;
                     lastSentNanos[0] = stamp;
                 }
                 StringBuilder sb = new StringBuilder("{\"type\":\"msg\",\"payload\":");

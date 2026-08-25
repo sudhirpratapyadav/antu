@@ -6,8 +6,8 @@ Enough of RFC 6455 to talk to the bridge: the handshake, masked text frames out,
 unmasked frames in, and ping/pong. Exists so the bridge can be exercised from a
 laptop without installing anything on either end.
 
-    ./tools/ws-client.py <host> watch /odom /base/status
-    ./tools/ws-client.py <host> topics
+    ./tools/ws-client.py <host> channels
+    ./tools/ws-client.py <host> watch base.odom base.status
     ./tools/ws-client.py <host> drive 0.0 0.35 3      # linearX rad/s seconds
 """
 import base64, json, os, socket, struct, sys, time
@@ -98,27 +98,27 @@ def main():
     try:
         first = ws.recv()                            # catalogue arrives unprompted
 
-        if cmd == "topics":
-            for t in first["payload"]["topics"]:
-                print("%-16s %-12s n=%-8s writable=%s"
-                      % (t["name"], t["type"], t["published"], t["writable"]))
+        if cmd == "channels":
+            for t in first["payload"]["channels"]:
+                print("%-16s %-12s n=%-8s readers=%s"
+                      % (t["name"], t["type"], t["published"], t["readers"]))
 
         elif cmd == "watch":
-            topics = sys.argv[3:] or ["/odom"]
+            channels = sys.argv[3:] or ["base.odom"]
             ws.send({"type": "subscribe",
-                     "payload": {"topics": topics, "maxHz": 5}})
+                     "payload": {"channels": channels, "maxHz": 5}})
             end = time.time() + 6
             while time.time() < end:
                 msg = ws.recv()
                 if msg is None:
                     break
                 if msg["type"] == "snapshot":
-                    for m in msg["payload"]["topics"]:
-                        print("snapshot %-14s %s" % (m["topic"], json.dumps(m["value"])[:110]))
+                    for m in msg["payload"]["channels"]:
+                        print("snapshot %-14s %s" % (m["channel"], json.dumps(m["value"])[:105]))
                 elif msg["type"] == "msg":
                     m = msg["payload"]
                     print("msg      %-14s seq=%-5s %s"
-                          % (m["topic"], m["seq"], json.dumps(m["value"])[:110]))
+                          % (m["channel"], m["seq"], json.dumps(m["value"])[:105]))
                 else:
                     print(msg)
 
@@ -126,12 +126,12 @@ def main():
             linear = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
             angular = float(sys.argv[4]) if len(sys.argv) > 4 else 0.3
             secs = float(sys.argv[5]) if len(sys.argv) > 5 else 3.0
-            ws.send({"type": "subscribe", "payload": {"topics": ["/odom"], "maxHz": 5}})
+            ws.send({"type": "subscribe",
+                     "payload": {"channels": ["base.odom"], "maxHz": 5}})
             end = time.time() + secs
             while time.time() < end:
-                ws.send({"type": "publish", "payload": {
-                    "topic": "/cmd_vel",
-                    "value": {"linearX": linear, "angular": angular}}})
+                ws.send({"type": "drive",
+                         "payload": {"linearX": linear, "angular": angular}})
                 time.sleep(0.1)
                 ws.sock.settimeout(0.2)
                 try:
@@ -141,8 +141,7 @@ def main():
                         print("theta=%7.3f  vel=%s" % (v["pose"]["theta"], v["velocity"]))
                 except (socket.timeout, OSError):
                     pass
-            ws.send({"type": "publish", "payload": {
-                "topic": "/cmd_vel", "value": {"linearX": 0, "angular": 0}}})
+            ws.send({"type": "drive", "payload": {"linearX": 0, "angular": 0}})
             print("stopped")
     finally:
         ws.close()
