@@ -45,8 +45,15 @@ body {
 #bar {
   flex: 0 0 auto; display: flex; align-items: center; gap: 14px;
   padding: 8px 12px; border-bottom: 1px solid var(--line);
-  background: #0e1319;
+  background: #0e1319; overflow: hidden; white-space: nowrap;
   padding-top: max(8px, env(safe-area-inset-top));
+}
+@media (max-width: 560px) {
+  /* Four stat groups will not fit. Battery and e-stop are the two worth losing
+     a robot over, so the model name and the label text go first. */
+  #bar { gap: 9px; font-size: 11px; padding: 7px 10px; }
+  #bar .stat span { display: none; }
+  #bar .name, #model { display: none; }
 }
 #bar .name { font-weight: 600; letter-spacing: .6px; font-size: 13px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); flex: 0 0 auto; }
@@ -62,6 +69,21 @@ body {
   flex: 1 1 auto; min-height: 0;      /* the line that prevents scrollbars */
   position: relative; background: #000; overflow: hidden;
 }
+/*
+  The picture, and the box the HUD is anchored to.
+
+  A 4:3 camera on a 16:9 monitor letterboxes, and overlays pinned to the stage
+  then float in black margins looking unrelated to the view. Locking a frame to
+  the video's aspect and hanging the HUD off that keeps it on the picture, which
+  is where a driving overlay belongs.
+
+  aspect-ratio with max-width/max-height and auto margins is the whole trick: the
+  box grows to fill whichever dimension runs out first and centres itself.
+*/
+#frame {
+  position: absolute; inset: 0; margin: auto;
+  aspect-ratio: 4 / 3; max-width: 100%; max-height: 100%;
+}
 #video {
   position: absolute; inset: 0; width: 100%; height: 100%;
   object-fit: contain;                 /* honest framing: never crop the robot's view */
@@ -76,16 +98,54 @@ body {
   position: absolute; background: var(--panel); border: 1px solid var(--line);
   border-radius: 10px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
 }
+/* Readouts are not controls; letting them intercept taps is a subtle trap. */
+#keys, #hud, #radarBox { pointer-events: none; }
 
-/* sonar minimap, bottom-left */
-#radarBox { left: var(--pad); bottom: var(--pad); padding: 6px; }
+/*
+  Controls live in a dock that is laid out twice.
+
+  Landscape and desktop: the dock overlays the picture exactly — same aspect
+  trick as the frame — so the sonar and stick sit in the corners of the view.
+
+  Portrait: a 4:3 picture leaves most of a phone screen empty below it, and
+  floating small controls on top of an already small video is the worst of both.
+  There the dock becomes a row under the picture, which gives the stick room to
+  be a real thumb target.
+*/
+#dock {
+  position: absolute; inset: 0; margin: auto;
+  aspect-ratio: 4 / 3; max-width: 100%; max-height: 100%;
+  pointer-events: none;               /* only the controls themselves take input */
+}
+#dock > * { pointer-events: auto; }
+
+#radarBox { position: absolute; left: var(--pad); bottom: var(--pad); padding: 6px; }
 #radar { display: block; width: 148px; height: 148px; }
-@media (max-width: 560px) { #radar { width: 108px; height: 108px; } }
 
-/* stick, bottom-right, where a thumb already is */
-#stickBox { right: var(--pad); bottom: var(--pad); padding: 6px; }
+#stickBox { position: absolute; right: var(--pad); bottom: var(--pad); padding: 6px; }
 #stick { display: block; width: 148px; height: 148px; touch-action: none; }
-@media (max-width: 560px) { #stick { width: 118px; height: 118px; } }
+
+@media (orientation: portrait) and (max-width: 900px) {
+  #stage { display: flex; flex-direction: column; }
+  #frame {
+    position: relative; inset: auto; margin: 0;
+    width: 100%; max-height: 62%; flex: 0 0 auto;
+  }
+  #dock {
+    position: relative; inset: auto; margin: 0;
+    aspect-ratio: auto; max-height: none;
+    flex: 1 1 auto; min-height: 0;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; padding: 10px;
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+  #radarBox, #stickBox, #actions { position: static; }
+  #actions { flex-direction: column; gap: 8px; }
+  #actions button { width: 100%; }
+  /* Sized from the viewport so it stays a thumb target on any phone. */
+  #radar { width: 26vw; height: 26vw; max-width: 132px; max-height: 132px; }
+  #stick { width: 36vw; height: 36vw; max-width: 190px; max-height: 190px; }
+}
 
 /* motion readout, bottom-centre between the two */
 #hud {
@@ -95,12 +155,17 @@ body {
 }
 @media (max-width: 720px) { #hud { display: none; } }
 
-/* controls, top-right of the stage */
-#actions { right: var(--pad); top: var(--pad); display: flex; gap: 6px; }
+/* controls, top-right of the picture */
+/* Positioned, unlike before: without this it fell into normal flow at the
+   stage's top-left and landed on top of the keyboard hints. */
+#actions {
+  position: absolute; right: var(--pad); top: var(--pad);
+  display: flex; gap: 6px; z-index: 3;
+}
 button {
   font: inherit; color: var(--text); cursor: pointer;
   background: var(--panel); border: 1px solid var(--line);
-  border-radius: 8px; padding: 8px 11px;
+  border-radius: 8px; padding: 10px 13px; min-height: 40px;   /* a thumb target */
   backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
 }
 button:active { transform: translateY(1px); }
@@ -112,7 +177,7 @@ button.on { background: rgba(63,185,80,.22); border-color: rgba(63,185,80,.5); c
 
 /* keyboard hint, top-left */
 #keys {
-  left: var(--pad); top: var(--pad); padding: 6px 9px;
+  left: var(--pad); top: var(--pad); padding: 6px 9px; z-index: 2;
   color: var(--dim); font-size: 10.5px; line-height: 1.7;
 }
 kbd {
@@ -124,13 +189,30 @@ kbd.hit { background: var(--accent); color: #06121f; border-color: var(--accent)
 @media (max-width: 720px) { #keys { display: none; } }
 
 /* ── diagnostics drawer ───────────────────────────────────────────────── */
+/*
+  Covers the stage, including the button that opened it — so it has to carry its
+  own way out. Three of them: the close button, Escape, and clicking the
+  background. A full-screen panel with no exit is a trap, and the keyboard
+  shortcut is no answer for anyone using a touchscreen.
+*/
 #drawer {
-  position: absolute; inset: 0; background: rgba(8,11,15,.93);
+  position: absolute; inset: 0; z-index: 5; background: rgba(8,11,15,.94);
   backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-  padding: 16px; display: none; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 14px; align-content: start; overflow: auto;
+  padding: 14px; display: none; flex-direction: column; gap: 12px;
 }
-#drawer.open { display: grid; }
+#drawer.open { display: flex; }
+#drawerHead {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+}
+#drawerHead .title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim);
+}
+#drawerBody {
+  flex: 1 1 auto; min-height: 0; overflow: auto;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 14px; align-content: start;
+}
+#closeBtn { margin-left: auto; }
 #drawer h3 {
   font-size: 10px; text-transform: uppercase; letter-spacing: .9px;
   color: var(--dim); margin-bottom: 6px; font-weight: 600;
@@ -157,6 +239,7 @@ kbd.hit { background: var(--accent); color: #06121f; border-color: var(--accent)
 </div>
 
 <div id="stage">
+ <div id="frame">
   <img id="video" alt="">
   <div id="noVideo">no video — is the app in the foreground?</div>
 
@@ -166,14 +249,17 @@ kbd.hit { background: var(--accent); color: #06121f; border-color: var(--accent)
     <kbd>m</kbd> motors &nbsp; <kbd>i</kbd> info &nbsp; <kbd>e</kbd> e-stop
   </div>
 
-  <div id="actions">
-    <button id="motorsBtn">motors</button>
-    <button id="infoBtn">info</button>
-    <button id="estopBtn">E-STOP</button>
-  </div>
+ </div>
 
-  <div class="overlay" id="radarBox"><canvas id="radar"></canvas></div>
-  <div class="overlay" id="stickBox"><canvas id="stick"></canvas></div>
+ <div id="dock">
+   <div class="overlay" id="radarBox"><canvas id="radar"></canvas></div>
+   <div id="actions">
+     <button id="motorsBtn">motors</button>
+     <button id="infoBtn">info</button>
+     <button id="estopBtn">E-STOP</button>
+   </div>
+   <div class="overlay" id="stickBox"><canvas id="stick"></canvas></div>
+ </div>
 
   <div class="overlay" id="hud">
     <div class="stat"><span>speed</span><b id="speed">–</b></div>
@@ -183,6 +269,11 @@ kbd.hit { background: var(--accent); color: #06121f; border-color: var(--accent)
   </div>
 
   <div id="drawer">
+   <div id="drawerHead">
+     <div class="title">diagnostics</div>
+     <button id="closeBtn">close ✕</button>
+   </div>
+   <div id="drawerBody">
     <div>
       <h3>odometry</h3>
       <table>
@@ -213,6 +304,7 @@ kbd.hit { background: var(--accent); color: #06121f; border-color: var(--accent)
       <h3>channels</h3>
       <table id="channels"></table>
     </div>
+   </div>
   </div>
 </div>
 

@@ -345,7 +345,11 @@ function wireKeyboard() {
     if (e.key === 'Shift') { slow = true; return; }
     if (e.key === ' ') { e.preventDefault(); release(); return; }
     if (e.key === 'm' || e.key === 'M') { toggleMotors(); return; }
-    if (e.key === 'i' || e.key === 'I') { el('drawer').classList.toggle('open'); return; }
+    if (e.key === 'i' || e.key === 'I') {
+      showDrawer(!el('drawer').classList.contains('open'));
+      return;
+    }
+    if (e.key === 'Escape') { showDrawer(false); return; }
     if (e.key === 'e' || e.key === 'E') { emergencyStop(); }
   });
 
@@ -379,10 +383,21 @@ function emergencyStop() {
   send({ type: 'estop', payload: {} });
 }
 
+function showDrawer(open) {
+  el('drawer').classList.toggle('open', open);
+}
+
 function wireButtons() {
   el('motorsBtn').onclick = toggleMotors;
   el('estopBtn').onclick = emergencyStop;
-  el('infoBtn').onclick = () => el('drawer').classList.toggle('open');
+  el('infoBtn').onclick = () => showDrawer(true);
+  el('closeBtn').onclick = () => showDrawer(false);
+
+  // Clicking the backdrop closes, but only the backdrop: a click that started on
+  // a panel must not dismiss it, or selecting a value becomes a fight.
+  el('drawer').addEventListener('mousedown', (e) => {
+    if (e.target === el('drawer')) showDrawer(false);
+  });
 }
 
 // ── video ──────────────────────────────────────────────────────────────────
