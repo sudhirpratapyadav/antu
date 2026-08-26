@@ -29,7 +29,6 @@ import com.antu.drivers.imu.PhoneImuDriver;
 import com.antu.ops.OpsNode;
 
 import com.arcos.Transport;
-import com.arcos.transport.SimTransport;
 import com.arcos.transport.UsbSerialTransport;
 
 /**
@@ -82,6 +81,13 @@ public final class RobotService extends Service {
 
     public static Graph graph() {
         return graph;
+    }
+
+    /** Why the last start failed, or null; shown on the phone where logcat is not. */
+    private static volatile String startFailure;
+
+    public static String startFailure() {
+        return startFailure;
     }
 
     /** The base driver, or null before the graph starts. */
@@ -159,7 +165,7 @@ public final class RobotService extends Service {
             // where types allow and by build() where they do not: a missing
             // connection, two writers on one input, or a cycle without a delayed
             // edge all fail here rather than on a moving robot.
-            ArcosBaseDriver base = new ArcosBaseDriver(this, chooseTransport());
+            ArcosBaseDriver base = new ArcosBaseDriver(this, usbTransport());
             OpsNode ops = new OpsNode(API_PORT, RobotService::graph, this::readAsset)
                     .withDiagnostics(RobotService::diagnostics)
                     .withBaseControls(
@@ -262,6 +268,7 @@ public final class RobotService extends Service {
             startStatsLogging();
         } catch (Exception e) {
             android.util.Log.e(TAG, "graph failed to start", e);
+            startFailure = e.getMessage() == null ? e.toString() : e.getMessage();
             stopSelf();
         }
     }
@@ -344,23 +351,18 @@ public final class RobotService extends Service {
     }
 
     /**
-     * The real base if an adapter is plugged in, the simulator otherwise.
+     * The real base over the USB serial adapter, and nothing else.
      *
-     * <p>Falling back rather than failing means the graph, the UI and every node
-     * above the driver can be developed and demonstrated with no robot present —
-     * the same reason the simulator exists in arcos-android at all.
+     * <p>There is deliberately no simulator to fall back to. A fake base answers
+     * every query, reports a healthy battery and integrates odometry from the
+     * commands it is given, so the console looks entirely normal while the robot
+     * sits silent — the one failure that took longest to see. Better that the app
+     * refuses to start, and says why, than that it pretends.
      */
-    private Transport chooseTransport() {
-        try {
-            if (!UsbSerialTransport.available(this).isEmpty()) {
-                android.util.Log.i(TAG, "using the USB serial adapter");
-                return new UsbSerialTransport(this);
-            }
-        } catch (Exception e) {
-            android.util.Log.w(TAG, "USB adapter unusable, falling back to the simulator: " + e.getMessage());
-        }
-        android.util.Log.i(TAG, "no USB adapter; using the simulator");
-        return new SimTransport();
+    private Transport usbTransport() throws java.io.IOException {
+        UsbSerialTransport t = new UsbSerialTransport(this);
+        android.util.Log.i(TAG, "using the USB serial adapter " + t.name());
+        return t;
     }
 
     /**

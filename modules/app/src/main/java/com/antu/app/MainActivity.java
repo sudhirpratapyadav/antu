@@ -70,6 +70,12 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         instance = new java.lang.ref.WeakReference<>(this);
 
+        // ARCore stops delivering frames the moment the display sleeps, and the
+        // service's wake lock only holds the CPU. On a phone bolted to a robot
+        // this activity is always the one in front, so keeping the screen on
+        // here is what keeps the camera, the tracker and the video stream alive.
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.parseColor("#0d1117"));
@@ -125,7 +131,9 @@ public final class MainActivity extends Activity {
     private void render() {
         Graph g = RobotService.graph();
         if (g == null) {
-            nodes.setText("service not running");
+            String why = RobotService.startFailure();
+            nodes.setText(why == null ? "service not running"
+                    : "service failed to start:\n" + why + "\n\nfix and relaunch");
             topics.setText("");
             return;
         }
