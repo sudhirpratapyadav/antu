@@ -219,7 +219,10 @@ function fit() {
 }
 
 /** Straight down, which is the floor plan the occupancy grid also sees. */
-function top() {
+// Not `top`: that is window.top, a non-configurable global, and a script-level
+// declaration by that name is a SyntaxError that stops the whole script — the
+// viewer showed "no cloud yet" forever with a full cloud on the server.
+function topView() {
   if (!xyz || !nPts) return;
   const [x0,y0,z0,x1,y1,z1] = bounds();
   cam.px=(x0+x1)/2; cam.py=(y0+y1)/2; cam.pz=(z0+z1)/2;
@@ -310,7 +313,7 @@ cv.addEventListener('contextmenu', e => e.preventDefault());
 window.addEventListener('resize', draw);
 
 $('fitBtn').onclick = fit;
-$('topBtn').onclick = top;
+$('topBtn').onclick = topView;
 $('liveBtn').onclick = () => {
   live = !live;
   $('liveBtn').classList.toggle('on', live);
