@@ -172,6 +172,12 @@ function render() {
 
   el('maxSpeed').textContent = fmt(slow ? MAX_SPEED * SLOW_FACTOR : MAX_SPEED, 2, ' m/s');
   drawRadar();
+
+  // Keep the robot marker tracking the pose. updateMarker is a no-op within a
+  // centimetre, so a parked robot costs nothing here.
+  const hadMarker = markerPose;
+  updateMarker();
+  if (markerPose !== hadMarker) cloudDraw();
 }
 
 function renderChannels(channels) {
@@ -319,6 +325,367 @@ function drawRadar() {
   ctx.lineTo(cx + 6, cy + 6);
   ctx.closePath();
   ctx.fill();
+}
+
+// ── view switching: hero + picture-in-picture ──────────────────────────────
+
+// Three live surfaces — camera, 2D map, 3D map — one large, two thumbnails.
+// Switching swaps class names only. Nothing is reparented and nothing stops
+// rendering: the thumbnails are the same elements drawing at a smaller size,
+// which is what makes them honest previews rather than stale snapshots.
+const VIEW_SURFACE = { camera: 'surfCam', map2d: 'surfMap', map3d: 'surfCloud' };
+const VIEW_LABEL = { camera: 'camera', map2d: '2D map', map3d: '3D map' };
+let heroView = 'camera';
+
+function applyViews() {
+  const pips = Object.keys(VIEW_SURFACE).filter((v) => v !== heroView);
+  el(VIEW_SURFACE[heroView]).className = 'surface hero';
+  el(VIEW_SURFACE[pips[0]]).className = 'surface pip0';
+  el(VIEW_SURFACE[pips[1]]).className = 'surface pip1';
+  el('heroTag').textContent = VIEW_LABEL[heroView];
+  document.body.dataset.view = heroView;
+  // Both canvases just changed size; redraw at the new one rather than letting
+  // the browser scale a stale frame.
+  drawRadar();
+  cloudDraw();
+}
+
+function setHero(view) {
+  if (view === heroView) return;
+  heroView = view;
+  // Remembered so a reload mid-drive comes back showing the same thing.
+  try { localStorage.setItem('antu.hero', view); } catch (e) { /* private mode */ }
+  applyViews();
+}
+
+function wireViews() {
+  try {
+    const saved = localStorage.getItem('antu.hero');
+    if (saved && VIEW_SURFACE[saved]) heroView = saved;
+  } catch (e) { /* private mode */ }
+  // #view=map3d opens on that view — a linkable way into a particular panel.
+  const asked = new URLSearchParams(location.hash.slice(1)).get('view');
+  if (asked && VIEW_SURFACE[asked]) heroView = asked;
+  for (const [view, id] of Object.entries(VIEW_SURFACE)) {
+    // Only a thumbnail switches; a click on the hero belongs to the hero.
+    el(id).addEventListener('click', () => { if (heroView !== view) setHero(view); });
+  }
+  applyViews();
+}
+
+// ── 3D cloud viewer ────────────────────────────────────────────────────────
+// The jarvis scan renderer, previously a separate /cloud.html page, now a
+// surface in the console. Points arrive in the tracker's world frame, which is
+// y-up, so the camera uses y as up and nothing needs converting.
+
+let cgl = null, cloudProg, cloudBuf, cloudPts = 0, cloudXyz = null;
+const cloudCam = { px: 0, py: 0, pz: 0, yaw: 0.7, pitch: 0.5, dist: 6, fovy: 1.0 };
+let cloudLive = true;
+// The robot's marker: a floor arrow rebuilt whenever fusion.pose moves.
+let markerBuf = null, markerVerts = 0, markerPose = null;
+// Where the floor sits in the cloud's y-up frame, estimated from the points
+// themselves at each load. ARCore's origin is wherever the phone woke up, so
+// nothing else knows the floor's height.
+let cloudFloorY = 0;
+
+const CLOUD_VS = `
+attribute vec3 pos; attribute vec3 col;
+uniform mat4 mvp; uniform float size;
+varying vec3 vcol;
+void main() {
+  gl_Position = mvp * vec4(pos, 1.0);
+  // Nearer points draw larger, which reads as depth without any shading.
+  gl_PointSize = max(1.0, size / max(gl_Position.w, 0.15));
+  vcol = col;
+}`;
+const CLOUD_FS = `
+precision mediump float;
+varying vec3 vcol;
+void main() { gl_FragColor = vec4(vcol, 1.0); }`;
+
+function cloudGlInit() {
+  cgl = el('gl3d').getContext('webgl', { antialias: true });
+  if (!cgl) { el('noCloud').textContent = 'WebGL unavailable in this browser'; return false; }
+  const sh = (t, src) => {
+    const o = cgl.createShader(t);
+    cgl.shaderSource(o, src); cgl.compileShader(o);
+    if (!cgl.getShaderParameter(o, cgl.COMPILE_STATUS)) throw cgl.getShaderInfoLog(o);
+    return o;
+  };
+  cloudProg = cgl.createProgram();
+  cgl.attachShader(cloudProg, sh(cgl.VERTEX_SHADER, CLOUD_VS));
+  cgl.attachShader(cloudProg, sh(cgl.FRAGMENT_SHADER, CLOUD_FS));
+  cgl.linkProgram(cloudProg);
+  cloudBuf = cgl.createBuffer();
+  cgl.enable(cgl.DEPTH_TEST);
+  return true;
+}
+
+function m4Persp(out, fovy, asp, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  out.fill(0);
+  out[0] = f / asp; out[5] = f;
+  out[10] = (far + near) * nf; out[11] = -1; out[14] = 2 * far * near * nf;
+  return out;
+}
+function m4LookAt(out, eye, ctr, up) {
+  let zx = eye[0]-ctr[0], zy = eye[1]-ctr[1], zz = eye[2]-ctr[2];
+  let l = Math.hypot(zx, zy, zz) || 1; zx/=l; zy/=l; zz/=l;
+  let xx = up[1]*zz - up[2]*zy, xy = up[2]*zx - up[0]*zz, xz = up[0]*zy - up[1]*zx;
+  l = Math.hypot(xx, xy, xz) || 1; xx/=l; xy/=l; xz/=l;
+  const yx = zy*xz - zz*xy, yy = zz*xx - zx*xz, yz = zx*xy - zy*xx;
+  out[0]=xx; out[1]=yx; out[2]=zx; out[3]=0;
+  out[4]=xy; out[5]=yy; out[6]=zy; out[7]=0;
+  out[8]=xz; out[9]=yz; out[10]=zz; out[11]=0;
+  out[12]=-(xx*eye[0]+xy*eye[1]+xz*eye[2]);
+  out[13]=-(yx*eye[0]+yy*eye[1]+yz*eye[2]);
+  out[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+  out[15]=1;
+  return out;
+}
+function m4Mul(out, a, b) {
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) {
+      let v = 0;
+      for (let k = 0; k < 4; k++) v += a[k*4+j] * b[i*4+k];
+      out[i*4+j] = v;
+    }
+  }
+  return out;
+}
+function cloudEye() {
+  const cp = Math.cos(cloudCam.pitch);
+  return [cloudCam.px + cloudCam.dist * cp * Math.sin(cloudCam.yaw),
+          cloudCam.py + cloudCam.dist * Math.sin(cloudCam.pitch),
+          cloudCam.pz + cloudCam.dist * cp * Math.cos(cloudCam.yaw)];
+}
+function cloudMvp() {
+  const cv = el('gl3d');
+  const P = m4Persp(new Float32Array(16), cloudCam.fovy, (cv.width / cv.height) || 1, 0.02, 400);
+  const V = m4LookAt(new Float32Array(16), cloudEye(),
+                     [cloudCam.px, cloudCam.py, cloudCam.pz], [0, 1, 0]);
+  return m4Mul(new Float32Array(16), P, V);
+}
+
+/** Count, then positions, then colours — packed, because JSON of this is huge. */
+async function cloudLoad() {
+  try {
+    const b = await (await fetch('/cloud.bin')).arrayBuffer();
+    if (b.byteLength < 4) return;
+    const n = new Int32Array(b, 0, 1)[0];
+    cloudPts = n;
+    el('cloudN').textContent = n.toLocaleString();
+    if (!n) return;
+    el('noCloud').style.display = 'none';
+
+    const pos = new Float32Array(b, 4, n * 3);
+    const col = new Uint8Array(b, 4 + n * 12, n * 3);
+    const first = !cloudXyz;
+    cloudXyz = pos;
+
+    // A near-minimum rather than the minimum: one depth artefact below the
+    // floor would otherwise sink the robot marker with it.
+    const ys = [];
+    for (let i = 0; i < n; i += Math.max(1, Math.floor(n / 500))) ys.push(pos[i*3+1]);
+    ys.sort((a, b2) => a - b2);
+    cloudFloorY = ys.length ? ys[Math.floor(ys.length * 0.05)] : 0;
+
+    if (!cgl && !cloudGlInit()) return;
+    const arr = new Float32Array(n * 6);
+    for (let i = 0; i < n; i++) {
+      arr[i*6] = pos[i*3]; arr[i*6+1] = pos[i*3+1]; arr[i*6+2] = pos[i*3+2];
+      arr[i*6+3] = col[i*3]/255; arr[i*6+4] = col[i*3+1]/255; arr[i*6+5] = col[i*3+2]/255;
+    }
+    cgl.bindBuffer(cgl.ARRAY_BUFFER, cloudBuf);
+    cgl.bufferData(cgl.ARRAY_BUFFER, arr, cgl.STATIC_DRAW);
+    // Frame it once on arrival; after that leave the camera where it was put,
+    // or it would snap away every few seconds as the cloud grows.
+    if (first) cloudFit(); else cloudDraw();
+  } catch (e) {
+    // The robot may be restarting; the next poll will find it.
+  }
+}
+
+function cloudBounds() {
+  let x0=1e9,y0=1e9,z0=1e9,x1=-1e9,y1=-1e9,z1=-1e9;
+  for (let i = 0; i < cloudPts; i++) {
+    const x=cloudXyz[i*3], y=cloudXyz[i*3+1], z=cloudXyz[i*3+2];
+    if(x<x0)x0=x; if(y<y0)y0=y; if(z<z0)z0=z;
+    if(x>x1)x1=x; if(y>y1)y1=y; if(z>z1)z1=z;
+  }
+  return [x0,y0,z0,x1,y1,z1];
+}
+
+function cloudFit() {
+  if (!cloudXyz || !cloudPts) return;
+  const [x0,y0,z0,x1,y1,z1] = cloudBounds();
+  cloudCam.px=(x0+x1)/2; cloudCam.py=(y0+y1)/2; cloudCam.pz=(z0+z1)/2;
+  cloudCam.dist = Math.max(0.6, Math.hypot(x1-x0, y1-y0, z1-z0) * 0.9);
+  cloudDraw();
+}
+
+/** Straight down, which is the floor plan the occupancy grid also sees. */
+// Not `top`: that is window.top, a non-configurable global, and a script-level
+// declaration by that name is a SyntaxError that stops the whole script.
+function cloudTopView() {
+  if (!cloudXyz || !cloudPts) return;
+  const [x0,y0,z0,x1,y1,z1] = cloudBounds();
+  cloudCam.px=(x0+x1)/2; cloudCam.py=(y0+y1)/2; cloudCam.pz=(z0+z1)/2;
+  cloudCam.pitch = 1.5; cloudCam.yaw = 0;
+  cloudCam.dist = Math.max(0.6, Math.hypot(x1-x0, z1-z0) * 1.1);
+  cloudDraw();
+}
+
+/**
+ * Rebuilds the robot marker from the fused pose: an arrow on the floor plus a
+ * post, so it reads from above and from the side alike.
+ *
+ * The fused pose is in the robot's z-up world and the cloud is in ARCore's
+ * y-up world. PoseFusion maps camera to robot as x = -z_ar, y = -x_ar, so the
+ * inverse used here is x_ar = -y, z_ar = -x; a heading of zero faces down
+ * ARCore's -z, which is where the camera looked at startup.
+ */
+function updateMarker() {
+  const f = latest['fusion.pose'];
+  if (!f || !cgl) return;
+  const p = f.pose;
+  if (markerPose && Math.abs(markerPose.x - p.x) < 0.01 &&
+      Math.abs(markerPose.y - p.y) < 0.01 &&
+      Math.abs(markerPose.theta - p.theta) < 0.01) return;
+  markerPose = { x: p.x, y: p.y, theta: p.theta };
+
+  const ax = -p.y, az = -p.x, ay = cloudFloorY + 0.03;
+  const fx = -Math.sin(p.theta), fz = -Math.cos(p.theta);   // forward, y-up frame
+  const rx = -fz, rz = fx;                                  // right = forward × up
+
+  // A solid arrow, not lines: WebGL line width is 1 px almost everywhere, and
+  // a hairline marker disappears into a 70,000-point cloud. Roughly the
+  // robot's own footprint, so it also communicates scale.
+  const apex = [ax + fx * 0.45, ay, az + fz * 0.45];
+  const left = [ax - fx * 0.18 + rx * 0.20, ay, az - fz * 0.18 + rz * 0.20];
+  const right = [ax - fx * 0.18 - rx * 0.20, ay, az - fz * 0.18 - rz * 0.20];
+  const peak = [ax, ay + 0.45, az];                         // a low pyramid, visible side-on
+
+  const C = [0.30, 0.64, 1.0];                              // the console accent
+  const W = [0.85, 0.93, 1.0];                              // apex, near-white
+  const v = (pt, c) => [pt[0], pt[1], pt[2], ...c];
+  const arr = new Float32Array([
+    ...v(apex, W), ...v(left, C), ...v(right, C),           // floor arrow
+    ...v(apex, W), ...v(peak, C), ...v(left, C),            // pyramid faces
+    ...v(apex, W), ...v(right, C), ...v(peak, C),
+    ...v(left, C), ...v(peak, C), ...v(right, C),
+  ]);
+  markerVerts = arr.length / 6;
+  if (!markerBuf) markerBuf = cgl.createBuffer();
+  cgl.bindBuffer(cgl.ARRAY_BUFFER, markerBuf);
+  cgl.bufferData(cgl.ARRAY_BUFFER, arr, cgl.DYNAMIC_DRAW);
+}
+
+function cloudDraw() {
+  if (!cgl || !cloudPts) return;
+  const cv = el('gl3d');
+  const ratio = window.devicePixelRatio || 1;
+  const w = Math.round(cv.clientWidth * ratio), h = Math.round(cv.clientHeight * ratio);
+  if (!w || !h) return;
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+
+  cgl.viewport(0, 0, cv.width, cv.height);
+  cgl.clearColor(0.02, 0.028, 0.04, 1);
+  cgl.clear(cgl.COLOR_BUFFER_BIT | cgl.DEPTH_BUFFER_BIT);
+  cgl.useProgram(cloudProg);
+
+  const pos = cgl.getAttribLocation(cloudProg, 'pos');
+  const col = cgl.getAttribLocation(cloudProg, 'col');
+  cgl.bindBuffer(cgl.ARRAY_BUFFER, cloudBuf);
+  cgl.enableVertexAttribArray(pos);
+  cgl.vertexAttribPointer(pos, 3, cgl.FLOAT, false, 24, 0);
+  cgl.enableVertexAttribArray(col);
+  cgl.vertexAttribPointer(col, 3, cgl.FLOAT, false, 24, 12);
+
+  cgl.uniformMatrix4fv(cgl.getUniformLocation(cloudProg, 'mvp'), false, cloudMvp());
+  cgl.uniform1f(cgl.getUniformLocation(cloudProg, 'size'),
+                3.5 * ratio * (heroView === 'map3d' ? 1 : 0.5));
+  cgl.drawArrays(cgl.POINTS, 0, cloudPts);
+
+  // The robot, on top of the cloud it is standing in. Same shader, same
+  // attribute layout; triangles just ignore gl_PointSize.
+  if (markerBuf && markerVerts) {
+    cgl.bindBuffer(cgl.ARRAY_BUFFER, markerBuf);
+    cgl.vertexAttribPointer(pos, 3, cgl.FLOAT, false, 24, 0);
+    cgl.vertexAttribPointer(col, 3, cgl.FLOAT, false, 24, 12);
+    cgl.drawArrays(cgl.TRIANGLES, 0, markerVerts);
+  }
+}
+
+function cloudPan(dx, dy) {
+  const e = cloudEye();
+  let fx = cloudCam.px-e[0], fy = cloudCam.py-e[1], fz = cloudCam.pz-e[2];
+  const fl = Math.hypot(fx,fy,fz)||1; fx/=fl; fy/=fl; fz/=fl;
+  let rx = -fz, rz = fx;
+  const rl = Math.hypot(rx,rz)||1; rx/=rl; rz/=rl;
+  const ux = fy*rz, uy = fz*rx - fx*rz, uz = -fy*rx;
+  const s = cloudCam.dist * 0.0022;
+  cloudCam.px += (-rx*dx + ux*dy) * s;
+  cloudCam.py += (uy*dy) * s;
+  cloudCam.pz += (-rz*dx + uz*dy) * s;
+}
+
+function wireCloud() {
+  // Gestures: drag rotates, two fingers or shift pans, pinch or wheel zooms.
+  // Bound to the canvas, which only receives input while the 3D map is the
+  // hero — as a thumbnail its children have pointer-events: none.
+  const ptrs = new Map();
+  let pinch0 = 0, lastPt = null;
+  const cv = el('gl3d');
+
+  cv.addEventListener('pointerdown', (e) => {
+    ptrs.set(e.pointerId, {x:e.clientX, y:e.clientY});
+    lastPt = {x:e.clientX, y:e.clientY};
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener('pointerup', (e) => { ptrs.delete(e.pointerId); pinch0 = 0; });
+  cv.addEventListener('pointercancel', (e) => { ptrs.delete(e.pointerId); pinch0 = 0; });
+  cv.addEventListener('pointermove', (e) => {
+    if (!ptrs.has(e.pointerId) || !lastPt) return;
+    ptrs.set(e.pointerId, {x:e.clientX, y:e.clientY});
+    if (ptrs.size >= 2) {
+      const p = [...ptrs.values()];
+      const d = Math.hypot(p[0].x-p[1].x, p[0].y-p[1].y);
+      if (pinch0) cloudCam.dist = Math.max(0.1, Math.min(120, cloudCam.dist * (pinch0/d)));
+      pinch0 = d;
+      const mx=(p[0].x+p[1].x)/2, my=(p[0].y+p[1].y)/2;
+      cloudPan(mx-lastPt.x, my-lastPt.y);
+      lastPt = {x:mx, y:my};
+      cloudDraw(); e.preventDefault(); return;
+    }
+    const dx = e.clientX-lastPt.x, dy = e.clientY-lastPt.y;
+    lastPt = {x:e.clientX, y:e.clientY};
+    if (e.shiftKey || e.buttons === 2 || e.buttons === 4) cloudPan(dx, dy);
+    else {
+      cloudCam.yaw -= dx*0.006;
+      // Stop just short of the poles, where the up vector degenerates and the
+      // view flips over.
+      cloudCam.pitch = Math.max(-1.5, Math.min(1.5, cloudCam.pitch + dy*0.006));
+    }
+    cloudDraw(); e.preventDefault();
+  });
+  cv.addEventListener('wheel', (e) => {
+    cloudCam.dist = Math.max(0.1, Math.min(120, cloudCam.dist * (e.deltaY > 0 ? 1.1 : 0.9)));
+    cloudDraw(); e.preventDefault();
+  }, { passive: false });
+  cv.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  el('fitBtn').onclick = cloudFit;
+  el('topBtn').onclick = cloudTopView;
+  el('liveBtn').onclick = () => {
+    cloudLive = !cloudLive;
+    el('liveBtn').classList.toggle('on', cloudLive);
+  };
+
+  cloudLoad();
+  // Depth produces a frame every few seconds, so polling faster would mostly
+  // re-fetch the same cloud. A hidden tab skips the fetch entirely.
+  setInterval(() => { if (cloudLive && !stopped && !document.hidden) cloudLoad(); }, 3000);
 }
 
 // ── command sources: stick and keyboard ────────────────────────────────────
@@ -516,7 +883,6 @@ function wireButtons() {
   el('motorsBtn').onclick = toggleMotors;
   el('estopBtn').onclick = emergencyStop;
   el('infoBtn').onclick = () => showDrawer(true);
-  el('mapBtn').onclick = () => { release(); location.href = '/cloud.html'; };
   el('closeBtn').onclick = () => showDrawer(false);
   el('quitBtn').onclick = quitApp;
 
@@ -543,11 +909,13 @@ function startVideo() {
 // Leaving the page must not leave the robot driving.
 document.addEventListener('visibilitychange', () => { if (document.hidden) release(); });
 window.addEventListener('pagehide', release);
-window.addEventListener('resize', () => { drawRadar(); drawStick(); });
+window.addEventListener('resize', () => { drawRadar(); drawStick(); cloudDraw(); });
 
 wireStick();
 wireKeyboard();
 wireButtons();
+wireViews();
+wireCloud();
 startVideo();
 connect();
 

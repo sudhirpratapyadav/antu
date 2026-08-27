@@ -48,7 +48,6 @@ body {
   background: #0e1319; overflow: hidden; white-space: nowrap;
   padding-top: max(8px, env(safe-area-inset-top));
 }
-}
 #bar .name { font-weight: 600; letter-spacing: .6px; font-size: 13px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); flex: 0 0 auto; }
 .dot.on { background: var(--good); box-shadow: 0 0 8px var(--good); }
@@ -78,22 +77,68 @@ body {
   position: absolute; inset: 0; margin: auto;
   aspect-ratio: 4 / 3; max-width: 100%; max-height: 100%;
 }
+/*
+  The frame holds three view surfaces — camera, 2D map, 3D map — laid out as one
+  hero and two picture-in-picture thumbnails (the oaa operations console
+  pattern). Every surface is always in the DOM and always live; switching views
+  swaps CSS classes, never reparents. That is deliberate: the video is a
+  streaming MJPEG <img> that a re-insert would reconnect, and the 3D canvas
+  holds a WebGL context that must not be disturbed.
+*/
+.surface { position: absolute; overflow: hidden; background: #000; }
+.surface.hero { inset: 0; z-index: 1; }
+.surface.pip0, .surface.pip1 {
+  width: clamp(96px, 24%, 180px); aspect-ratio: 4 / 3; bottom: var(--pad);
+  border: 1px solid var(--line); border-radius: 10px; z-index: 4;
+  cursor: pointer; box-shadow: 0 4px 18px rgba(0,0,0,.55);
+}
+.surface.pip0 { left: var(--pad); }
+.surface.pip1 { left: calc(var(--pad) + clamp(96px, 24%, 180px) + 8px); }
+.surface.pip0:hover, .surface.pip1:hover { border-color: var(--accent); }
+/* A thumbnail is one button. Its content must not eat the tap. */
+.surface.pip0 > :not(.viewTag), .surface.pip1 > :not(.viewTag) { pointer-events: none; }
+.viewTag {
+  position: absolute; left: 0; right: 0; bottom: 0; padding: 2px 6px;
+  font-size: 10px; color: var(--dim); background: rgba(8,11,15,.78);
+  text-transform: uppercase; letter-spacing: .5px; pointer-events: none;
+  display: none; z-index: 2;
+}
+.surface.pip0 .viewTag, .surface.pip1 .viewTag { display: block; }
+/* The hero names itself top-right, clear of the keys hint and the pips. */
+#heroTag {
+  /* Below the action buttons, which own the top-right corner. */
+  position: absolute; right: var(--pad); top: calc(var(--pad) + 50px); z-index: 2;
+  padding: 4px 8px; border-radius: 6px; background: rgba(8,11,15,.7);
+  color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+  pointer-events: none;
+}
+.surface canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+#gl3d { touch-action: none; }
 #video {
   position: absolute; inset: 0; width: 100%; height: 100%;
   object-fit: contain;                 /* honest framing: never crop the robot's view */
   display: block;
 }
-#noVideo {
+#noVideo, #noCloud {
   position: absolute; inset: 0; display: flex; align-items: center;
   justify-content: center; color: var(--dim); font-size: 12px; text-align: center;
-  padding: 20px;
+  padding: 20px; line-height: 1.8;
 }
+/* 3D camera controls, only meaningful when the 3D map is the hero. */
+#cloudTools { left: var(--pad); top: var(--pad); padding: 6px; display: none; gap: 6px; align-items: center; z-index: 3; }
+.surface.hero #cloudTools { display: flex; }
+#cloudTools .stat { padding: 0 4px; }
+/* Thumbnail hint text shrinks to nothing; hide the noise, keep the picture. */
+.surface.pip0 #noCloud, .surface.pip1 #noCloud,
+.surface.pip0 #noVideo, .surface.pip1 #noVideo { font-size: 9px; padding: 6px; }
 .overlay {
   position: absolute; background: var(--panel); border: 1px solid var(--line);
   border-radius: 10px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
 }
 /* Readouts are not controls; letting them intercept taps is a subtle trap. */
-#keys, #hud, #radarBox { pointer-events: none; }
+#keys, #hud { pointer-events: none; }
+/* Driving hints over a map are clutter; the keys still work, the card hides. */
+body[data-view="map3d"] #keys, body[data-view="map2d"] #keys { display: none; }
 
 /*
   Controls live in a dock that is laid out twice.
@@ -113,15 +158,13 @@ body {
 }
 #dock > * { pointer-events: auto; }
 
-#radarBox { position: absolute; left: var(--pad); bottom: var(--pad); padding: 6px; }
-#radar { display: block; width: 148px; height: 148px; }
-
-#stickBox { position: absolute; right: var(--pad); bottom: var(--pad); padding: 6px; }
+/* Above the hero surface (z 1), like every other control that floats on it. */
+#stickBox { position: absolute; right: var(--pad); bottom: var(--pad); padding: 6px; z-index: 4; }
 #stick { display: block; width: 148px; height: 148px; touch-action: none; }
 
 /* motion readout, bottom-centre between the two */
 #hud {
-  left: 50%; transform: translateX(-50%); bottom: var(--pad);
+  left: 50%; transform: translateX(-50%); bottom: var(--pad); z-index: 2;
   padding: 7px 12px; display: flex; gap: 16px; align-items: baseline;
   white-space: nowrap;
 }
@@ -243,19 +286,17 @@ kbd.hit { background: var(--accent); color: #06121f; border-color: var(--accent)
     flex: 0 0 auto;
     display: grid; gap: 10px; padding: 10px;
     padding-bottom: max(10px, env(safe-area-inset-bottom));
-    grid-template-columns: auto 1fr auto;
-    grid-template-areas: "radar . stick" "actions actions actions";
+    grid-template-columns: 1fr auto;
+    grid-template-areas: ". stick" "actions actions";
     align-items: center;
   }
-  #radarBox { position: static; grid-area: radar; }
   #stickBox { position: static; grid-area: stick; justify-self: end; }
   #actions {
     position: static; grid-area: actions;
     flex-direction: row; gap: 8px;
   }
   #actions button { flex: 1; }
-  /* Sized from the viewport so these stay real targets on any phone. */
-  #radar { width: 24vw; height: 24vw; max-width: 128px; max-height: 128px; }
+  /* Sized from the viewport so this stays a real target on any phone. */
   #stick { width: 40vw; height: 40vw; max-width: 210px; max-height: 210px; }
 }
 </style>
@@ -276,8 +317,31 @@ kbd.hit { background: var(--accent); color: #06121f; border-color: var(--accent)
 
 <div id="stage">
  <div id="frame">
-  <img id="video" alt="">
-  <div id="noVideo">no video — is the app in the foreground?</div>
+  <div class="surface hero" id="surfCam">
+    <img id="video" alt="">
+    <div id="noVideo">no video — is the app in the foreground?</div>
+    <span class="viewTag">camera</span>
+  </div>
+
+  <div class="surface pip0" id="surfMap">
+    <canvas id="radar"></canvas>
+    <span class="viewTag">2D map</span>
+  </div>
+
+  <div class="surface pip1" id="surfCloud">
+    <canvas id="gl3d"></canvas>
+    <div id="noCloud">no cloud yet — drive the robot<br>
+      <span style="font-size:10.5px">depth runs about once every six seconds</span></div>
+    <div class="overlay" id="cloudTools">
+      <button id="fitBtn">fit</button>
+      <button id="topBtn">top</button>
+      <button id="liveBtn" class="on">live</button>
+      <div class="stat"><span>pts</span><b id="cloudN">–</b></div>
+    </div>
+    <span class="viewTag">3D map</span>
+  </div>
+
+  <span id="heroTag">camera</span>
 
   <div class="overlay" id="keys">
     <kbd id="k-up">↑</kbd><kbd id="k-down">↓</kbd><kbd id="k-left">←</kbd><kbd id="k-right">→</kbd> drive<br>
@@ -288,10 +352,8 @@ kbd.hit { background: var(--accent); color: #06121f; border-color: var(--accent)
  </div>
 
  <div id="dock">
-   <div class="overlay" id="radarBox"><canvas id="radar"></canvas></div>
    <div id="actions">
      <button id="motorsBtn">motors</button>
-     <button id="mapBtn">3D map</button>
      <button id="infoBtn">info</button>
      <button id="estopBtn">E-STOP</button>
    </div>
