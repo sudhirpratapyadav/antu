@@ -17,6 +17,7 @@ import com.antu.core.log.Log;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
 import com.antu.brain.CommandArbiter;
+import com.antu.brain.MoveExecutor;
 import com.antu.brain.PoseFusion;
 import com.antu.drivers.base.ArcosBaseDriver;
 import com.antu.drivers.ar.ArTrackerDriver;
@@ -204,12 +205,40 @@ public final class RobotService extends Service {
             // not rationed. What stays on the phone is what must not lag: the
             // tracker, the fusion, and the safety chain around the base.
             if (tracker != null) {
+                // The guarded motion primitive: turn-then-drive, closed-loop on
+                // the fused pose, bounded to one short step per request. This is
+                // the verb a remote agent conjugates; it goes through the
+                // arbiter's autonomy input, so teleop still overrides it.
+                MoveExecutor move = new MoveExecutor();
+
                 // 10 Hz: ARCore runs at camera rate on its own thread, and the
                 // newest estimate is the only one worth republishing.
                 builder.add(tracker, Rate.hz(10))
                        .add(fusion, Rate.hz(10))
+                       .add(move, Rate.hz(15))
                        .connect(tracker.pose, fusion.tracked)
-                       .connect(base.odom, fusion.odom);
+                       .connect(base.odom, fusion.odom)
+                       .connect(fusion.pose, move.pose)
+                       .connect(move.cmdVel, arbiter.autonomy);
+
+                // Blocking by design: the reply is the outcome, which is what a
+                // planner polling for "did that work" would otherwise reinvent.
+                ops.route("/api/move", r -> {
+                    double deg = r.number("deg", 0);
+                    double metres = r.number("m", 0);
+                    double speed = r.number("speed", 0.25);
+                    MoveExecutor.Result result = move.execute(
+                            Math.toRadians(deg), metres, speed);
+                    StringBuilder sb = new StringBuilder("{\"outcome\":\"")
+                            .append(result.outcome).append('"');
+                    if (result.finalPose != null) {
+                        sb.append(",\"x\":").append(result.finalPose.x)
+                          .append(",\"y\":").append(result.finalPose.y)
+                          .append(",\"theta\":").append(result.finalPose.theta);
+                    }
+                    return com.antu.ops.HttpServer.Response.json(
+                            sb.append('}').toString());
+                });
             } else {
                 builder.add(camera, Rate.hz(15));
             }

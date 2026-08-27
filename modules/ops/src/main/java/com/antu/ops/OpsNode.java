@@ -361,6 +361,17 @@ public final class OpsNode extends Node {
         }
     }
 
+    /**
+     * Registers an extra HTTP route, so wiring code can expose robot-specific
+     * endpoints — a motion primitive, a calibration hook — without this node
+     * learning their types. Ops stays generic over channels; the app, which
+     * already knows every concrete node, owns what is specific.
+     */
+    public OpsNode route(String path, HttpServer.Handler handler) {
+        server.route(path, handler);
+        return this;
+    }
+
     /** Where the API is reachable, for the console to display. */
     public String address() {
         return HttpServer.localAddress() + ":" + port;
