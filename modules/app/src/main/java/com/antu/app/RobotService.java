@@ -10,7 +10,6 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 
-import java.io.File;
 
 import com.antu.core.graph.Channel;
 import com.antu.core.graph.Graph;
@@ -18,13 +17,10 @@ import com.antu.core.log.Log;
 import com.antu.core.time.Clock;
 import com.antu.core.time.Rate;
 import com.antu.brain.CommandArbiter;
-import com.antu.brain.CloudMap;
-import com.antu.brain.OccupancyMapper;
 import com.antu.brain.PoseFusion;
 import com.antu.drivers.base.ArcosBaseDriver;
 import com.antu.drivers.ar.ArTrackerDriver;
 import com.antu.drivers.camera.CameraDriver;
-import com.antu.drivers.depth.DepthMapper;
 import com.antu.drivers.imu.PhoneImuDriver;
 import com.antu.ops.OpsNode;
 
@@ -64,11 +60,6 @@ public final class RobotService extends Service {
 
     /** The tracker, or null when running plain video instead. */
     private static volatile ArTrackerDriver arTracker;
-    /** The depth model, or null without a tracker to feed it. */
-    private static volatile DepthMapper depthMapper;
-
-    /** Read from the app's external files dir; see tools/push-depth-model.sh. */
-    private static final String DEPTH_MODEL = "da_metric_hypersim_small.onnx";
 
     /** Port for the operations API. */
     private static final int API_PORT = 8080;
@@ -114,17 +105,6 @@ public final class RobotService extends Service {
               .append(",\"framesDropped\":").append(t.droppedFrames())
               .append(",\"failure\":")
               .append(t.failure() == null ? "null" : "\"" + t.failure() + "\"")
-              .append('}');
-        }
-        DepthMapper d = depthMapper;
-        sb.append(",\"depth\":");
-        if (d == null) {
-            sb.append("null");
-        } else {
-            sb.append("{\"inferences\":").append(d.inferences())
-              .append(",\"lastMs\":").append(d.lastMillis())
-              .append(",\"failure\":")
-              .append(d.failure() == null ? "null" : "\"" + d.failure() + "\"")
               .append('}');
         }
 
@@ -215,46 +195,21 @@ public final class RobotService extends Service {
             // Fusion only makes sense with a tracker to anchor to; without one
             // the wheels are the whole story and base.odom already says so.
             PoseFusion fusion = tracker == null ? null : new PoseFusion();
-            // The phone sits about 30 cm above the floor on this robot, which is
-            // what places the obstacle band; see setCameraHeight.
-            OccupancyMapper mapper = tracker == null ? null
-                    : new OccupancyMapper().setCameraHeight(0.30);
 
-            // The only sensor that can see an obstacle on this robot: the sonar
-            // ring is deaf and the phone has no depth camera. Absent the model
-            // file the node reports itself unavailable and the rest still drives.
-            // The same points, kept in three dimensions. The occupancy grid is
-            // for planning; this is the model of the space.
-            CloudMap cloud = tracker == null ? null : new CloudMap();
-
-            DepthMapper depth = tracker == null ? null
-                    // Two of eight cores, measured. jarvis found eight fastest
-                    // running alone; here four gave 6.7 s inference and 56 loop
-                    // overruns, two gave about 10 s and none. Depth waiting costs
-                    // nothing, a stuttering control loop costs pose.
-                    : new DepthMapper(new File(getExternalFilesDir(null), DEPTH_MODEL), 2)
-                            .setRest(2.5);
-            depthMapper = depth;
-
+            // No depth network, no voxel cloud, no occupancy mapper on this
+            // branch. The phone is deliberately just a sensor head and a pair of
+            // motors: posed frames and a fused pose go out over the ops API, and
+            // whatever intelligence consumes them — an agent harness on a laptop,
+            // a model behind an HTTP API — lives off the robot, where compute is
+            // not rationed. What stays on the phone is what must not lag: the
+            // tracker, the fusion, and the safety chain around the base.
             if (tracker != null) {
                 // 10 Hz: ARCore runs at camera rate on its own thread, and the
                 // newest estimate is the only one worth republishing.
                 builder.add(tracker, Rate.hz(10))
                        .add(fusion, Rate.hz(10))
-                       // 2 Hz: the map changes slowly, and every publish copies
-                       // the whole grid.
-                       .add(mapper, Rate.hz(2))
                        .connect(tracker.pose, fusion.tracked)
-                       .connect(base.odom, fusion.odom)
-                       // 1 Hz: inference is about half a second, and it shares
-                       // cores with ARCore, which matters more.
-                       .add(depth, Rate.hz(1))
-                       .connect(tracker.frame, depth.frame)
-                       .add(cloud, Rate.hz(1))
-                       .connect(depth.points, mapper.points)
-                       .connect(fusion.pose, mapper.pose)
-                       .connect(depth.points, cloud.points)
-                       .connect(fusion.pose, cloud.pose);
+                       .connect(base.odom, fusion.odom);
             } else {
                 builder.add(camera, Rate.hz(15));
             }
@@ -294,7 +249,6 @@ public final class RobotService extends Service {
             }
             baseDriver = null;
             arTracker = null;
-            depthMapper = null;
             cameraDriver = null;
             stopSelf();
             MainActivity.quit();
@@ -418,7 +372,6 @@ public final class RobotService extends Service {
         baseDriver = null;
         cameraDriver = null;
         arTracker = null;
-        depthMapper = null;
         if (g != null) {
             g.stop();
         }

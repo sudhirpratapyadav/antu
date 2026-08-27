@@ -402,6 +402,7 @@ public final class OpsNode extends Node {
         server.route("/video.mjpeg", r -> mjpeg(r.text("channel", videoChannel)));
         server.route("/cloud.bin", r -> cloudBinary(r.text("channel", "cloud.cloud")));
         server.route("/cloud.ply", r -> ply(r.text("channel", "cloud.cloud")));
+        server.route("/api/observe", r -> observe());
         server.route("/api/diag", r -> {
             Supplier<String> d = diagnostics;
             return HttpServer.Response.json(d == null ? "{}" : d.get());
@@ -551,6 +552,63 @@ public final class OpsNode extends Node {
                 + ",\"stampNanos\":" + latest.stamp().nanos()
                 + ",\"seq\":" + latest.sequence()
                 + ",\"value\":" + Json.encode(latest.payload()) + "}");
+    }
+
+    /**
+     * One observation, atomically: the newest posed camera frame together with
+     * the fused pose and base state, as a single JSON object.
+     *
+     * <p>This is the endpoint an external agent polls — a VLM harness on a
+     * laptop, a model behind an HTTP API. One request yields one self-contained
+     * snapshot: no WebSocket subscription to manage, no pairing frames with
+     * poses on the client, and the JPEG rides along base64-encoded because a
+     * multimodal model wants it in that form anyway. At ~90 KB per call this is
+     * not a streaming interface; it is a "look" primitive, made for a consumer
+     * that thinks between looks.
+     */
+    private HttpServer.Response observe() {
+        Graph g = graphSupplier.get();
+        if (g == null) {
+            return HttpServer.Response.error(503, "graph not running");
+        }
+        StringBuilder sb = new StringBuilder(140_000);
+        sb.append('{');
+
+        // Whichever frame source the graph has: posed frames when the tracker
+        // runs, bare camera frames otherwise.
+        Channel<?> frames = g.channel("ar.frame");
+        if (frames == null) {
+            frames = g.channel("camera.frame");
+        }
+        Message<?> m = frames == null ? null : frames.latest();
+        sb.append("\"frame\":");
+        if (m == null) {
+            sb.append("null");
+        } else {
+            // The registered encoder supplies the metadata — size, camera pose,
+            // intrinsics — and the pixels travel alongside it.
+            Object payload = m.payload();
+            VideoFrame image = payload instanceof PosedFrame
+                    ? ((PosedFrame) payload).image : (VideoFrame) payload;
+            sb.append("{\"stampNanos\":").append(m.stamp().nanos())
+              .append(",\"seq\":").append(m.sequence())
+              .append(",\"meta\":").append(Json.encode(payload))
+              .append(",\"jpegBase64\":\"")
+              .append(java.util.Base64.getEncoder().encodeToString(image.jpeg()))
+              .append("\"}");
+        }
+        appendLatest(sb, g, "pose", "fusion.pose");
+        appendLatest(sb, g, "odom", "base.odom");
+        appendLatest(sb, g, "status", "base.status");
+        return HttpServer.Response.json(sb.append('}').toString());
+    }
+
+    /** Appends {@code ,"key": <latest payload or null>} for a named channel. */
+    private static void appendLatest(StringBuilder sb, Graph g, String key, String name) {
+        Channel<?> ch = g.channel(name);
+        Message<?> m = ch == null ? null : ch.latest();
+        sb.append(",\"").append(key).append("\":")
+          .append(m == null ? "null" : Json.encode(m.payload()));
     }
 
     private HttpServer.Response asset(HttpServer.Request r) {
