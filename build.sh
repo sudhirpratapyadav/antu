@@ -1,7 +1,8 @@
 #!/bin/bash
 # Builds antu without Gradle: a JDK plus the SDK build tools is enough.
 #
-#   ./build.sh          everything - pure modules, tests, then the APK
+#   ./build.sh          everything - pure modules, tests, then the robot APK
+#   ./build.sh mapper   the same, but package the handheld mapping app instead
 #   ./build.sh test     pure-JVM tests only (no SDK needed)
 #   ./build.sh core     the Android-free modules only
 #
@@ -14,7 +15,11 @@
 #
 #   drivers Android-aware: hardware, and the arcos base.
 #   ops     Android-aware: server, bridge, web assets.
-#   app     the Android shell that wires a graph together.
+#   app     the Android shell that wires the robot's graph together.
+#   mapper  a second shell: the mapping graph alone, for a phone in a hand.
+#           Both shells share every module and the console assets; only the
+#           manifest and the wiring differ, so they are two APKs from one
+#           compile.
 set -e
 cd "$(dirname "$0")"
 
@@ -24,7 +29,8 @@ MIN_API=21
 ABI=arm64-v8a
 
 PURE_MODULES="core brain ops"
-ANDROID_MODULES="drivers app"
+ANDROID_MODULES="drivers app mapper"
+APP=app
 
 sources() {   # sources <module> [test]
   local dir="modules/$1/src/${2:-main}/java"
@@ -69,6 +75,7 @@ run_tests() {
 }
 
 case "${1:-all}" in
+  mapper) APP=mapper ;;
   test) build_pure >/dev/null 2>&1 || true; run_tests; exit 0 ;;
   core) rm -rf $OUT/classes; build_pure; run_tests
         mkdir -p $OUT && (cd $OUT/classes && jar cf ../antu-core.jar com)
@@ -122,7 +129,7 @@ fi
 
 echo "== aapt2 link"
 "$SDK/aapt2" link -o $OUT/app.unsigned.apk \
-    --manifest modules/app/AndroidManifest.xml \
+    --manifest modules/$APP/AndroidManifest.xml \
     -I "$SDK/android.jar" -A modules/app/assets --min-sdk-version $MIN_API
 
 echo "== d8"
@@ -142,9 +149,11 @@ if [ ! -f debug.keystore ]; then
     -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
     -dname "CN=Android Debug,O=Android,C=US"
 fi
+APK=$OUT/antu.apk
+[ "$APP" = app ] || APK=$OUT/antu-$APP.apk
 java -jar "$SDK/lib/apksigner.jar" sign --ks debug.keystore \
      --ks-pass pass:android --key-pass pass:android \
-     --out $OUT/antu.apk $OUT/app.aligned.apk
+     --out $APK $OUT/app.aligned.apk
 
 echo
-echo "Built: $OUT/antu.apk"
+echo "Built: $APK"
